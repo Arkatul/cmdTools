@@ -42,44 +42,6 @@ prefill_read() {
   tmp="${tmp:-$def}"
   printf -v "$__var" "%s" "$tmp"
 }
-
-spinner_until() {
-  # spinner_until pid "message"
-  local pid="$1" msg="$2"
-  local spin='|/-\' i=0
-  printf "%s " "$msg"
-  while kill -0 "$pid" 2>/dev/null; do
-    printf "\r%s %s" "$msg" "${spin:i++%${#spin}:1}"
-    sleep 0.1
-  done
-  printf "\r%-60s\r" ""  # clear line
-}
-
-pick_rg_by_search() {
-  # pick_rg_by_search array_rgs...
-  local rgs=("$@") term matches rg
-  while true; do
-    read -r -p "Search resource groups (blank to list all): " term
-    if [[ -z "$term" ]]; then
-      matches=("${rgs[@]}")
-    else
-      mapfile -t matches < <(printf "%s\n" "${rgs[@]}" | grep -i -- "$term" || true)
-    fi
-    if (( ${#matches[@]} == 0 )); then
-      echo "No resource groups match '$term'. Try again."
-      continue
-    fi
-    echo "Matching resource groups:"
-    printf '  %s\n' "${matches[@]}"
-    read -r -p "Resource group name: " rg
-    if printf '%s\n' "${rgs[@]}" | grep -Fxq -- "$rg"; then
-      printf '%s' "$rg"
-      return
-    else
-      echo "Resource group '$rg' not found. Try again."
-    fi
-  done
-}
 menu_pick() {
   # menu_pick "Prompt" array_items...
   local prompt="$1"; shift
@@ -144,36 +106,18 @@ fi
 location=""
 prefill_read location "Deployment location: " "WestEurope"
 
-# ---------- 5) fetch RGs in background ----------
-tmp_rg="$(mktemp)"
-cleanup() { rm -f "$tmp_rg"; }
-trap cleanup EXIT
-
-# kick off background query
-( az group list --query "[].name" -o tsv > "$tmp_rg" ) &
-rg_pid=$!
-
-# ---------- do other prompts while RGs load ----------
-echo "Collecting resource groups in background…"
-
-# ---------- 6) ask for RG with assisted picker ----------
-# ensure the RG list is ready; if not, show a spinner
-if kill -0 "$rg_pid" 2>/dev/null; then
-  spinner_until "$rg_pid" "Fetching resource groups"
-fi
-wait "$rg_pid" || { err "Failed to query resource groups. Are you logged in and the subscription selected? (az login / az account set)"; exit 1; }
-
-if [[ ! -s "$tmp_rg" ]]; then
-  err "No resource groups found in the current subscription."
-  exit 1
-fi
-mapfile -t RGS < "$tmp_rg"
-
-rg_name="$(pick_rg_by_search "${RGS[@]}")"
+# ---------- 5) resource group name ----------
+read -r -p "Resource group name: " rg_name
 if [[ -z "$rg_name" ]]; then
-  err "No resource group selected."
+  err "Resource group name is required."
   exit 1
 fi
+
+# ---------- 6) deployment name ----------
+folder_name="$(basename "$PWD")"
+def_deploy="deploy-${folder_name}-$(date +%Y%m%d)"
+deployment_name=""
+prefill_read deployment_name "Deployment name: " "$def_deploy"
 
 # ---------- 7) summary & confirm ----------
 echo
@@ -182,6 +126,7 @@ echo "  Template     : $chosen_bicep"
 echo "  Parameters   : ${chosen_params:-<none>}"
 echo "  Location     : $location"
 echo "  ResourceGroup: $rg_name"
+echo "  Deployment   : $deployment_name"
 echo
 
 if ! ask_yn "Proceed with deployment?" "N"; then
@@ -192,6 +137,7 @@ fi
 # ---------- 8) deploy ----------
 cmd=( az deployment group create
   --resource-group "$rg_name"
+  --name "$deployment_name"
   --template-file "$chosen_bicep"
   --location "$location"
 )
