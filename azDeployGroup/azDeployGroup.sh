@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # deploy-bicep.sh
-# Requirements: Azure CLI (az). Optional: fzf for a nicer RG picker.
+# Requirements: Azure CLI (az)
 
 set -euo pipefail
 
@@ -55,46 +55,30 @@ spinner_until() {
   printf "\r%-60s\r" ""  # clear line
 }
 
-pick_rg_from_list() {
-  # pick_rg_from_list "prompt" array_rgs...
-  local prompt="$1"; shift
-  local rgs=("$@")
-
-  if command -v fzf >/dev/null 2>&1; then
-    printf "%s\n" "${rgs[@]}" | fzf --prompt="${prompt} " --height=15 --reverse --border
-    return
-  fi
-
-  # fallback: tab-completion based picker using readline
-  local rg
-  __RG_LIST=("${rgs[@]}")
-  _rg_tab_complete() {
-    local cur=${READLINE_LINE:0:READLINE_POINT}
-    local matches=($(compgen -W "${__RG_LIST[*]}" -- "$cur"))
-    if (( ${#matches[@]} == 1 )); then
-      READLINE_LINE="${matches[0]}"
-      READLINE_POINT=${#READLINE_LINE}
-    elif (( ${#matches[@]} > 1 )); then
-      printf '\n%s\n' "${matches[@]}"
-      printf '%s' "${prompt} ${READLINE_LINE}"
+pick_rg_by_search() {
+  # pick_rg_by_search array_rgs...
+  local rgs=("$@") term matches rg
+  while true; do
+    read -r -p "Search resource groups (blank to list all): " term
+    if [[ -z "$term" ]]; then
+      matches=("${rgs[@]}")
+    else
+      mapfile -t matches < <(printf "%s\n" "${rgs[@]}" | grep -i -- "$term" || true)
     fi
-  }
-
-  if bind -x '"\t":_rg_tab_complete' 2>/dev/null; then
-    while true; do
-      read -e -p "${prompt} " rg
-      if printf '%s\n' "${rgs[@]}" | grep -Fxq "$rg"; then
-        bind -r '\t'
-        printf '%s' "$rg"
-        return
-      else
-        echo "Invalid resource group. Press TAB for completion."
-      fi
-    done
-  fi
-
-  # if bind failed (non-interactive shell), use numbered menu
-  select_from_list "$prompt" "${rgs[@]}"
+    if (( ${#matches[@]} == 0 )); then
+      echo "No resource groups match '$term'. Try again."
+      continue
+    fi
+    echo "Matching resource groups:"
+    printf '  %s\n' "${matches[@]}"
+    read -r -p "Resource group name: " rg
+    if printf '%s\n' "${rgs[@]}" | grep -Fxq -- "$rg"; then
+      printf '%s' "$rg"
+      return
+    else
+      echo "Resource group '$rg' not found. Try again."
+    fi
+  done
 }
 menu_pick() {
   # menu_pick "Prompt" array_items...
@@ -185,7 +169,7 @@ if [[ ! -s "$tmp_rg" ]]; then
 fi
 mapfile -t RGS < "$tmp_rg"
 
-rg_name="$(pick_rg_from_list "Resource group>" "${RGS[@]}")"
+rg_name="$(pick_rg_by_search "${RGS[@]}")"
 if [[ -z "$rg_name" ]]; then
   err "No resource group selected."
   exit 1
