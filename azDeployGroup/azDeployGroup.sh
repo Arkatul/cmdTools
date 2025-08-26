@@ -43,14 +43,15 @@ prefill_read() {
   printf -v "$__var" "%s" "$tmp"
 }
 menu_pick() {
-  # menu_pick "Prompt" array_items...
+  # menu_pick var_name "Prompt" array_items...
+  local __var="$1"; shift
   local prompt="$1"; shift
   local items=("$@")
   local PS3="Enter number (1-${#items[@]}): "
   echo "$prompt"
   select opt in "${items[@]}"; do
     if [[ -n "$opt" ]]; then
-      printf "%s" "$opt"
+      printf -v "$__var" "%s" "$opt"
       break
     else
       echo "Invalid choice."
@@ -96,7 +97,7 @@ else
     fi
   else
     if ask_yn "Use a parameters file?" "Y"; then
-      chosen_params="$(menu_pick "Select parameters file:" "${PARAMS[@]}")"
+      menu_pick chosen_params "Select parameters file:" "${PARAMS[@]}"
     fi
   fi
 fi
