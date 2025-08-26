@@ -101,6 +101,21 @@ pick_rg_from_list() {
     fi
   done
 }
+menu_pick() {
+  # menu_pick "Prompt" array_items...
+  local prompt="$1"; shift
+  local items=("$@")
+  local PS3="Enter number (1-${#items[@]}): "
+  echo "$prompt"
+  select opt in "${items[@]}"; do
+    if [[ -n "$opt" ]]; then
+      printf "%s" "$opt"
+      break
+    else
+      echo "Invalid choice."
+    fi
+  done
+}
 
 # ---------- 1) discover files ----------
 shopt -s nullglob
@@ -133,16 +148,18 @@ if (( ${#PARAMS[@]} == 0 )); then
   echo "No .bicepparam files found. Continue without parameters file."
 else
   if (( ${#PARAMS[@]} == 1 )); then
-    echo "Found single parameter file: ${PARAMS[0]}"
+    echo "Found single parameter file:"
+    printf "  1) %s\n" "${PARAMS[0]}"
     if ask_yn "Use this parameters file?" "Y"; then
       chosen_params="${PARAMS[0]}"
     fi
   else
     if ask_yn "Use a parameters file?" "Y"; then
-      chosen_params="$(select_from_list "Select parameters file:" "${PARAMS[@]}")"
+      chosen_params="$(menu_pick "Select parameters file:" "${PARAMS[@]}")"
     fi
   fi
 fi
+
 
 # ---------- 4) location (default WestEurope) ----------
 location=""
