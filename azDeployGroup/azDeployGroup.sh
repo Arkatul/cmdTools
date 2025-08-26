@@ -65,41 +65,36 @@ pick_rg_from_list() {
     return
   fi
 
-  # fallback: simple "type prefix, see top 5, or exact match"
-  local input matches
-  while true; do
-    read -r -p "${prompt} (type start of name, ENTER to list top 20): " input || true
-    if [[ -z "$input" ]]; then
-      printf "%s\n" "${rgs[@]}" | head -n 20
-      continue
-    fi
-    # show up to 5 matches by prefix (case-insensitive)
-    mapfile -t matches < <(printf "%s\n" "${rgs[@]}" | grep -i "^${input}" | head -n 5 || true)
+  # fallback: tab-completion based picker using readline
+  local rg
+  __RG_LIST=("${rgs[@]}")
+  _rg_tab_complete() {
+    local cur=${READLINE_LINE:0:READLINE_POINT}
+    local matches=($(compgen -W "${__RG_LIST[*]}" -- "$cur"))
     if (( ${#matches[@]} == 1 )); then
-      echo "${matches[0]}"
-      return
+      READLINE_LINE="${matches[0]}"
+      READLINE_POINT=${#READLINE_LINE}
     elif (( ${#matches[@]} > 1 )); then
-      echo "Matches:"
-      printf "  %s\n" "${matches[@]}"
-      # let the user choose by number
-      local choice
-      read -r -p "Pick exact RG (type it) or number (1-${#matches[@]}): " choice || true
-      if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#matches[@]} )); then
-        echo "${matches[$((choice-1))]}"
-        return
-      elif [[ -n "$choice" ]]; then
-        # if they typed a name, accept if it exists in full list
-        if printf "%s\n" "${rgs[@]}" | grep -Fxq "$choice"; then
-          echo "$choice"
-          return
-        else
-          echo "No exact RG '$choice' found."
-        fi
-      fi
-    else
-      echo "No RGs found starting with '$input'."
+      printf '\n%s\n' "${matches[@]}"
+      printf '%s' "${prompt} ${READLINE_LINE}"
     fi
-  done
+  }
+
+  if bind -x '"\t":_rg_tab_complete' 2>/dev/null; then
+    while true; do
+      read -e -p "${prompt} " rg
+      if printf '%s\n' "${rgs[@]}" | grep -Fxq "$rg"; then
+        bind -r '\t'
+        printf '%s' "$rg"
+        return
+      else
+        echo "Invalid resource group. Press TAB for completion."
+      fi
+    done
+  fi
+
+  # if bind failed (non-interactive shell), use numbered menu
+  select_from_list "$prompt" "${rgs[@]}"
 }
 menu_pick() {
   # menu_pick "Prompt" array_items...
