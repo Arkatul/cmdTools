@@ -102,18 +102,35 @@ else
 fi
 
 
-# ---------- 4) location (default WestEurope) ----------
-location=""
-prefill_read location "Deployment location: " "WestEurope"
-
-# ---------- 5) resource group name ----------
-read -r -p "Resource group name: " rg_name
+# ---------- 4) resource group name with tab completion ----------
+rg_name=""
+if command -v az >/dev/null 2>&1; then
+  mapfile -t ALL_RGS < <(az group list --query "[].name" -o tsv | sort)
+fi
+if (( ${#ALL_RGS[@]} > 0 )) && [[ -t 0 && -t 1 ]]; then
+  tmpdir="$(mktemp -d)"
+  for rg in "${ALL_RGS[@]}"; do
+    touch "$tmpdir/$rg"
+  done
+  pushd "$tmpdir" >/dev/null
+  while [[ -z "$rg_name" ]]; do
+    read -e -p "Resource group name: " rg_name
+    [[ " ${ALL_RGS[*]} " == *" $rg_name "* ]] || {
+      echo "Invalid resource group. Press Tab for suggestions."
+      rg_name=""
+    }
+  done
+  popd >/dev/null
+  rm -rf "$tmpdir"
+else
+  read -r -p "Resource group name: " rg_name
+fi
 if [[ -z "$rg_name" ]]; then
   err "Resource group name is required."
   exit 1
 fi
 
-# ---------- 6) deployment name ----------
+# ---------- 5) deployment name ----------
 folder_name="$(basename "$PWD")"
 def_deploy="deploy-${folder_name}-$(date +%Y%m%d)"
 deployment_name=""
@@ -124,7 +141,6 @@ echo
 echo "Summary:"
 echo "  Template     : $chosen_bicep"
 echo "  Parameters   : ${chosen_params:-<none>}"
-echo "  Location     : $location"
 echo "  ResourceGroup: $rg_name"
 echo "  Deployment   : $deployment_name"
 echo
@@ -139,7 +155,6 @@ cmd=( az deployment group create
   --resource-group "$rg_name"
   --name "$deployment_name"
   --template-file "$chosen_bicep"
-  --location "$location"
 )
 if [[ -n "$chosen_params" ]]; then
   # Use @file syntax to pass the bicepparam content
