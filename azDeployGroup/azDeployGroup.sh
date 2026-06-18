@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # deploy-bicep.sh
-# Requirements: Azure CLI (az). Optional: fzf for a nicer RG picker.
+# Requirements: Azure CLI (az)
 
 set -euo pipefail
 
@@ -42,62 +42,19 @@ prefill_read() {
   tmp="${tmp:-$def}"
   printf -v "$__var" "%s" "$tmp"
 }
-
-spinner_until() {
-  # spinner_until pid "message"
-  local pid="$1" msg="$2"
-  local spin='|/-\' i=0
-  printf "%s " "$msg"
-  while kill -0 "$pid" 2>/dev/null; do
-    printf "\r%s %s" "$msg" "${spin:i++%${#spin}:1}"
-    sleep 0.1
-  done
-  printf "\r%-60s\r" ""  # clear line
-}
-
-pick_rg_from_list() {
-  # pick_rg_from_list "prompt" array_rgs...
+menu_pick() {
+  # menu_pick var_name "Prompt" array_items...
+  local __var="$1"; shift
   local prompt="$1"; shift
-  local rgs=("$@")
-
-  if command -v fzf >/dev/null 2>&1; then
-    printf "%s\n" "${rgs[@]}" | fzf --prompt="${prompt} " --height=15 --reverse --border
-    return
-  fi
-
-  # fallback: simple "type prefix, see top 5, or exact match"
-  local input matches
-  while true; do
-    read -r -p "${prompt} (type start of name, ENTER to list top 20): " input || true
-    if [[ -z "$input" ]]; then
-      printf "%s\n" "${rgs[@]}" | head -n 20
-      continue
-    fi
-    # show up to 5 matches by prefix (case-insensitive)
-    mapfile -t matches < <(printf "%s\n" "${rgs[@]}" | grep -i "^${input}" | head -n 5 || true)
-    if (( ${#matches[@]} == 1 )); then
-      echo "${matches[0]}"
-      return
-    elif (( ${#matches[@]} > 1 )); then
-      echo "Matches:"
-      printf "  %s\n" "${matches[@]}"
-      # let the user choose by number
-      local choice
-      read -r -p "Pick exact RG (type it) or number (1-${#matches[@]}): " choice || true
-      if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#matches[@]} )); then
-        echo "${matches[$((choice-1))]}"
-        return
-      elif [[ -n "$choice" ]]; then
-        # if they typed a name, accept if it exists in full list
-        if printf "%s\n" "${rgs[@]}" | grep -Fxq "$choice"; then
-          echo "$choice"
-          return
-        else
-          echo "No exact RG '$choice' found."
-        fi
-      fi
+  local items=("$@")
+  local PS3="Enter number (1-${#items[@]}): "
+  echo "$prompt"
+  select opt in "${items[@]}"; do
+    if [[ -n "$opt" ]]; then
+      printf -v "$__var" "%s" "$opt"
+      break
     else
-      echo "No RGs found starting with '$input'."
+      echo "Invalid choice."
     fi
   done
 }
@@ -133,59 +90,60 @@ if (( ${#PARAMS[@]} == 0 )); then
   echo "No .bicepparam files found. Continue without parameters file."
 else
   if (( ${#PARAMS[@]} == 1 )); then
-    echo "Found single parameter file: ${PARAMS[0]}"
+    echo "Found single parameter file:"
+    printf "  1) %s\n" "${PARAMS[0]}"
     if ask_yn "Use this parameters file?" "Y"; then
       chosen_params="${PARAMS[0]}"
     fi
   else
     if ask_yn "Use a parameters file?" "Y"; then
-      chosen_params="$(select_from_list "Select parameters file:" "${PARAMS[@]}")"
+      menu_pick chosen_params "Select parameters file:" "${PARAMS[@]}"
     fi
   fi
 fi
 
-# ---------- 4) location (default WestEurope) ----------
-location=""
-prefill_read location "Deployment location: " "WestEurope"
 
-# ---------- 5) fetch RGs in background ----------
-tmp_rg="$(mktemp)"
-cleanup() { rm -f "$tmp_rg"; }
-trap cleanup EXIT
-
-# kick off background query
-( az group list --query "[].name" -o tsv > "$tmp_rg" ) &
-rg_pid=$!
-
-# ---------- do other prompts while RGs load ----------
-echo "Collecting resource groups in background…"
-
-# ---------- 6) ask for RG with assisted picker ----------
-# ensure the RG list is ready; if not, show a spinner
-if kill -0 "$rg_pid" 2>/dev/null; then
-  spinner_until "$rg_pid" "Fetching resource groups"
+# ---------- 4) resource group name with tab completion ----------
+rg_name=""
+if command -v az >/dev/null 2>&1; then
+  mapfile -t ALL_RGS < <(az group list --query "[].name" -o tsv | sort)
 fi
-wait "$rg_pid" || { err "Failed to query resource groups. Are you logged in and the subscription selected? (az login / az account set)"; exit 1; }
-
-if [[ ! -s "$tmp_rg" ]]; then
-  err "No resource groups found in the current subscription."
-  exit 1
+if (( ${#ALL_RGS[@]} > 0 )) && [[ -t 0 && -t 1 ]]; then
+  tmpdir="$(mktemp -d)"
+  for rg in "${ALL_RGS[@]}"; do
+    touch "$tmpdir/$rg"
+  done
+  pushd "$tmpdir" >/dev/null
+  while [[ -z "$rg_name" ]]; do
+    read -e -p "Resource group name: " rg_name
+    [[ " ${ALL_RGS[*]} " == *" $rg_name "* ]] || {
+      echo "Invalid resource group. Press Tab for suggestions."
+      rg_name=""
+    }
+  done
+  popd >/dev/null
+  rm -rf "$tmpdir"
+else
+  read -r -p "Resource group name: " rg_name
 fi
-mapfile -t RGS < "$tmp_rg"
-
-rg_name="$(pick_rg_from_list "Resource group>" "${RGS[@]}")"
 if [[ -z "$rg_name" ]]; then
-  err "No resource group selected."
+  err "Resource group name is required."
   exit 1
 fi
+
+# ---------- 5) deployment name ----------
+folder_name="$(basename "$PWD")"
+def_deploy="deploy-${folder_name}-$(date +%Y%m%d)"
+deployment_name=""
+prefill_read deployment_name "Deployment name: " "$def_deploy"
 
 # ---------- 7) summary & confirm ----------
 echo
 echo "Summary:"
 echo "  Template     : $chosen_bicep"
 echo "  Parameters   : ${chosen_params:-<none>}"
-echo "  Location     : $location"
 echo "  ResourceGroup: $rg_name"
+echo "  Deployment   : $deployment_name"
 echo
 
 if ! ask_yn "Proceed with deployment?" "N"; then
@@ -196,8 +154,8 @@ fi
 # ---------- 8) deploy ----------
 cmd=( az deployment group create
   --resource-group "$rg_name"
+  --name "$deployment_name"
   --template-file "$chosen_bicep"
-  --location "$location"
 )
 if [[ -n "$chosen_params" ]]; then
   # Use @file syntax to pass the bicepparam content
