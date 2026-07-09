@@ -2,8 +2,7 @@
 
 set -euo pipefail
 
-command -v curl >/dev/null 2>&1 || { echo "curl is required"; exit 1; }
-command -v jq   >/dev/null 2>&1 || { echo "jq is required"; exit 1; }
+command -v shuf >/dev/null 2>&1 || { echo "shuf is required (coreutils)"; exit 1; }
 
 # ===== CONFIGURABLE PARAMETERS =====
 NUM_WORDS=4
@@ -75,11 +74,40 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ===== VALIDATE PARAMETERS =====
+for pair in "num-words:$NUM_WORDS" "num-specials:$NUM_SPECIALS" "num-digits:$NUM_DIGITS"; do
+    name="${pair%%:*}"
+    value="${pair#*:}"
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        echo "Error: --$name must be a non-negative integer, got '$value'" >&2
+        exit 1
+    fi
+done
+
+if [[ ! "$CASE_PROFILE" =~ ^[1-5]$ ]]; then
+    echo "Error: --case-profile must be an integer 1-5, got '$CASE_PROFILE'" >&2
+    exit 1
+fi
+
+if [[ -z "$ALLOWED_SPECIALS" ]]; then
+    echo "Error: --allowed-specials must not be empty" >&2
+    exit 1
+fi
+
+if [[ -z "$SEPARATORS" ]]; then
+    echo "Error: --separators must not be empty" >&2
+    exit 1
+fi
+
 # ===== FUNCTION: Get random characters from a set =====
 rand_chars() {
     local set="$1"
     local count="$2"
     local output=""
+    if (( ${#set} == 0 )); then
+        echo "rand_chars: empty character set" >&2
+        exit 1
+    fi
     for ((i = 0; i < count; i++)); do
         rand_index=$(( RANDOM % ${#set} ))
         output+="${set:$rand_index:1}"
@@ -87,11 +115,30 @@ rand_chars() {
     echo "$output"
 }
 
-# ===== GET RANDOM WORDS =====
-WORDS=$(curl -s "https://random-word-api.vercel.app/api?words=$NUM_WORDS" | jq -r '.[]')
+# ===== LOCATE WORDLIST =====
+# Order: explicit override, system install location, next to this script (dev mode).
+if [[ -n "${GENPASSPHRASE_WORDLIST:-}" ]]; then
+    WORDLIST_FILE="$GENPASSPHRASE_WORDLIST"
+elif [[ -f "/usr/local/share/genpassphrase/wordlist.txt" ]]; then
+    WORDLIST_FILE="/usr/local/share/genpassphrase/wordlist.txt"
+else
+    WORDLIST_FILE="$(dirname "$(readlink -f "$0")")/wordlist.txt"
+fi
 
-# Convert to array
-readarray -t WORD_ARRAY <<< "$WORDS"
+if [[ ! -r "$WORDLIST_FILE" ]]; then
+    echo "Error: wordlist not found or not readable at '$WORDLIST_FILE'" >&2
+    echo "Run install.sh, or set GENPASSPHRASE_WORDLIST to a valid wordlist file." >&2
+    exit 1
+fi
+
+# ===== PICK RANDOM WORDS FROM LOCAL WORDLIST =====
+WORDLIST_LINES=$(wc -l < "$WORDLIST_FILE")
+if (( NUM_WORDS > WORDLIST_LINES )); then
+    echo "Error: --num-words ($NUM_WORDS) exceeds the wordlist size ($WORDLIST_LINES words)" >&2
+    exit 1
+fi
+
+readarray -t WORD_ARRAY < <(shuf -n "$NUM_WORDS" "$WORDLIST_FILE")
 
 apply_case_profile() {
     local i j word len index out char
@@ -119,6 +166,9 @@ apply_case_profile() {
             for ((i=0; i<${#WORD_ARRAY[@]}; i++)); do
                 word="${WORD_ARRAY[i],,}"
                 len=${#word}
+                if (( len == 0 )); then
+                    continue
+                fi
                 index=$(( RANDOM % len ))
                 char="${word:index:1}"
                 WORD_ARRAY[i]="${word:0:index}${char^^}${word:index+1}"
@@ -138,6 +188,10 @@ apply_case_profile() {
                 done
                 WORD_ARRAY[i]="$out"
             done
+            ;;
+        *)
+            echo "Error: invalid case profile '$CASE_PROFILE' (must be 1-5)" >&2
+            exit 1
             ;;
     esac
 }
