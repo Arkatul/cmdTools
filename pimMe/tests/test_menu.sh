@@ -79,6 +79,49 @@ run_case "0 (hors borne) puis 2"            '0\n2\n'                     1
 run_case "1 backspace 4 puis Entree"        '1\177 4\n'                  3
 run_case "bas puis numero 4"                '\033[B4\n'                  3
 
+printf '\n=== Touches d action (goal 2 : bascule de scope) ===\n'
+# run_case ne sert pas ici : on doit lire A LA FOIS stdout (la touche) et le
+# code retour, sur une fonction qui renvoie normalement un index.
+run_hotkey() {
+    local label="$1" keys="$2" exp_key="$3" got rc
+    MENU_HOTKEYS=("a" "e")
+    got="$(printf '%b' "$keys" | select_from_menu "Choisir :" "${OPTS[@]}" 2>/dev/null)"
+    rc=$?
+    MENU_HOTKEYS=()
+    if [[ "$got" == "$exp_key" && $rc -eq $MENU_HOTKEY_PRESSED ]]; then
+        printf 'PASS  %-42s -> touche "%s", rc=%s\n' "$label" "$got" "$rc"
+    else
+        printf 'FAIL  %-42s -> attendu "%s"/rc=%s, obtenu "%s"/rc=%s\n' \
+            "$label" "$exp_key" "$MENU_HOTKEY_PRESSED" "$got" "$rc"
+        fails=$((fails + 1))
+    fi
+}
+
+run_hotkey "a immediat"                     'a'              a
+run_hotkey "e immediat"                     'e'              e
+run_hotkey "apres navigation (bas, bas, e)" '\033[B\033[B e' e
+run_hotkey "apres saisie partielle (1 puis a)" '1a'          a
+
+# Hors liste de hotkeys, la touche doit etre ignoree, pas interceptee.
+MENU_HOTKEYS=("a" "e")
+got="$(printf 'z2\n' | select_from_menu "Choisir :" "${OPTS[@]}" 2>/dev/null)"; rc=$?
+MENU_HOTKEYS=()
+if [[ "$got" == "1" && $rc -eq 0 ]]; then
+    printf 'PASS  %-42s -> index 1\n' "touche hors liste (z) ignoree"
+else
+    printf 'FAIL  %-42s -> attendu idx=1 rc=0, obtenu "%s"/rc=%s\n' "touche hors liste (z) ignoree" "$got" "$rc"
+    fails=$((fails + 1))
+fi
+
+# Sans hotkeys declarees, le contrat du goal 1 doit etre strictement inchange.
+got="$(printf 'a2\n' | select_from_menu "Choisir :" "${OPTS[@]}" 2>/dev/null)"; rc=$?
+if [[ "$got" == "1" && $rc -eq 0 ]]; then
+    printf 'PASS  %-42s -> index 1\n' "MENU_HOTKEYS vide : a sans effet"
+else
+    printf 'FAIL  %-42s -> attendu idx=1 rc=0, obtenu "%s"/rc=%s\n' "MENU_HOTKEYS vide : a sans effet" "$got" "$rc"
+    fails=$((fails + 1))
+fi
+
 printf '\n=== Contrat d appel ===\n'
 # Le sentinel ne doit pas retomber dans la plage des signaux (128+N) : le trap
 # Ctrl+C du goal 4 doit rester distinguable d une annulation de menu.
