@@ -3,8 +3,9 @@
 # pim-activate.sh — Activation interactive de rôles PIM Azure / Entra ID.
 #
 # Alternative rapide au portail pour activer un rôle éligible : liste les rôles
-# activables de l'utilisateur connecté, en sélectionne un au clavier, et soumet
-# la demande d'activation.
+# activables de l'utilisateur connecté, en sélectionne un au clavier, demande
+# une justification, soumet la demande d'activation et suit son statut jusqu'au
+# provisionnement.
 #
 # Usage :
 #   ./pim-activate.sh [-s|--scope azure|entra] [-h|--help]
@@ -17,7 +18,9 @@
 #   - bash 4+ (tableaux, read -rsn1) — pas de compatibilité sh POSIX visée
 #   - az   : Azure CLI, avec une session active (`az login` au préalable ;
 #            le script ne déclenche jamais de login automatique)
-#   - jq   : parsing des réponses JSON
+#   - jq   : parsing des réponses JSON et construction des corps de requête
+#   - uuidgen (facultatif) : identifiant de la demande d'activation ARM ;
+#            repli automatique sur /proc/sys/kernel/random/uuid
 #
 # Codes de sortie :
 #   0   succès
@@ -32,12 +35,13 @@ set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 
-# Durée d'activation par défaut (heures), utilisée par le flux d'activation
-# (goal 3) lorsque la politique PIM n'expose pas de maximum exploitable.
+# Durée d'activation demandée (heures). L'API d'éligibilité n'expose pas le
+# maximum autorisé par la politique PIM : la valeur est envoyée telle quelle et
+# un refus de la politique est diagnostiqué par explain_az_error.
 # Voir plan.md — hypothèse à ajuster selon le tenant.
 DEFAULT_DURATION_HOURS=8
 
-# Périmètre courant : azure | entra. Bascule à chaud prévue au goal 2.
+# Périmètre courant : azure | entra. Bascule à chaud par les touches a/e.
 SCOPE="azure"
 
 MENU_HINT="Flèches haut/bas + Entrée, numéro + Entrée, q pour annuler : "
@@ -403,7 +407,7 @@ list_azure_roles() {
 
     if ! body="$(az_rest_get "$ARM_ELIGIBLE_URL")"; then
         err "Échec de la récupération des rôles Azure eligible."
-        az_rest_last_error >&2
+        explain_az_error
         return 1
     fi
 
@@ -431,14 +435,7 @@ list_entra_roles() {
 
     if ! body="$(az_rest_get "$GRAPH_ELIGIBLE_URL")"; then
         err "Échec de la récupération des rôles Entra eligible."
-        # Cas fréquent et non corrigeable côté script : l'app Azure CLI n'a pas
-        # reçu le consentement Graph nécessaire dans ce tenant.
-        if az_rest_last_error | grep -q PermissionScopeNotGranted; then
-            err "L'application Azure CLI n'a pas les permissions Graph requises sur ce tenant."
-            err "Un administrateur doit consentir RoleManagement.Read.Directory (ou"
-            err "RoleEligibilitySchedule.Read.Directory) pour l'app 04b07795-8ddb-461a-bbee-02f9e1bf7b46."
-        fi
-        az_rest_last_error >&2
+        explain_az_error
         return 1
     fi
 
@@ -485,7 +482,7 @@ other_scope() {
     [[ "$1" == "azure" ]] && printf 'entra' || printf 'azure'
 }
 
-# Affiche le rôle choisi et ce que goal 3 consommera.
+# Récapitulatif du rôle choisi, affiché juste avant le prompt de justification.
 show_selection() {
     local index="$1"
 
@@ -494,7 +491,6 @@ show_selection() {
     printf '  roleDefinitionId     : %s\n' "${ROLE_DEFINITION_IDS[$index]}" >&2
     printf '  scope                : %s\n' "${ROLE_SCOPES[$index]}" >&2
     printf '  schedule eligible    : %s\n' "${ROLE_SCHEDULE_IDS[$index]}" >&2
-    printf '\nL'"'"'activation est hors périmètre du goal 2 (voir goal 3).\n' >&2
 }
 
 # Boucle de listing : affiche le scope courant, bascule sur a/e, sort sur q ou
@@ -537,8 +533,11 @@ browse_roles() {
 
         case $rc in
             0)
-                show_selection "$selection"
-                return 0
+                # `cmd; return $?` ne suffit pas sous set -e : un échec de
+                # activate_role sortirait du script avant le return.
+                rc=0
+                activate_role "$selection" || rc=$?
+                return "$rc"
                 ;;
             "$MENU_HOTKEY_PRESSED")
                 case "$selection" in
@@ -564,6 +563,331 @@ prompt_scope_switch() {
 
     read -r -p "Basculer vers le scope ${target} ? [o/N] " answer || return 1
     [[ "$answer" =~ ^[oOyY]$ ]]
+}
+
+# ---------------------------------------------------------------------------
+# Flux d'activation
+#
+# principalId : sur ce tenant les éligibilités sont portées par des GROUPES
+# (cf. section listing) — `properties.principalId` d'une instance vaut donc
+# l'objectId du GROUPE, jamais celui de l'utilisateur, et ne peut pas servir de
+# principalId à un SelfActivate. L'objectId de l'utilisateur est lu dans la
+# claim `oid` du jeton ARM plutôt que via `az ad signed-in-user show` : cela
+# n'ajoute aucune dépendance à Graph, dont ce tenant refuse déjà certaines
+# permissions à l'app Azure CLI (cf. explain_az_error).
+#
+# Le corps JSON part en argument `--body` et non via `@fichier` : az est ici le
+# binaire Windows sous WSL et ne saurait pas lire un chemin WSL. Vérifié :
+# l'interop WSL préserve guillemets et accents dans argv.
+# ---------------------------------------------------------------------------
+
+# Placeholder « business » proposé à l'écran, éditable avant validation.
+DEFAULT_JUSTIFICATION="Intervention support — troubleshooting"
+
+# Polling du statut de la demande. Pas de workflow d'approbation en v1
+# (cf. plan.md) : on affiche l'état et on sort au bout du timeout.
+POLL_INTERVAL_SECONDS=4
+POLL_TIMEOUT_SECONDS=60
+
+GRAPH_REQUESTS_URL="https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests"
+
+AZ_PRINCIPAL_ID=""
+JUSTIFICATION=""
+POLL_URL=""
+
+# Traduit les erreurs az récurrentes en message actionnable, puis affiche le
+# détail brut. Partagé par le listing et l'activation.
+explain_az_error() {
+    local raw
+    raw="$(az_rest_last_error)"
+
+    case "$raw" in
+        *PermissionScopeNotGranted*)
+            err "L'application Azure CLI n'a pas les permissions Graph requises sur ce tenant."
+            err "Un administrateur doit consentir RoleManagement.Read.Directory (ou"
+            err "RoleEligibilitySchedule.Read.Directory) pour l'app 04b07795-8ddb-461a-bbee-02f9e1bf7b46."
+            ;;
+        *AADSTS70043*|*token_expired*|*invalid_grant*)
+            err "Session Azure CLI expirée (sign-in frequency de l'accès conditionnel)."
+            err "Relancez 'az login --tenant ${AZ_TENANT_ID:-<tenant>}' puis réessayez."
+            ;;
+        *AADSTS50076*|*AADSTS50079*|*MFA*|*mfa*|*claims*)
+            err "Ce rôle exige une authentification forte (MFA) récente."
+            err "Relancez 'az login --scope https://graph.microsoft.com//.default' puis réessayez."
+            ;;
+        *RoleAssignmentRequestPolicyValidationFailed*|*MaximumDuration*|*maximum*duration*)
+            err "Durée demandée refusée par la politique PIM du rôle."
+            err "Baissez DEFAULT_DURATION_HOURS (actuellement ${DEFAULT_DURATION_HOURS}h) en tête de script."
+            ;;
+    esac
+
+    if [[ -n "$raw" ]]; then
+        printf '%s\n' "$raw" >&2
+    fi
+    return 0
+}
+
+# Extrait la claim `oid` du payload d'un JWT (base64url, padding tronqué).
+_jwt_oid() {
+    local payload="$1" pad
+
+    payload="${payload//-/+}"
+    payload="${payload//_//}"
+    pad=$(( (4 - ${#payload} % 4) % 4 ))
+    while (( pad-- > 0 )); do
+        payload+="="
+    done
+
+    printf '%s' "$payload" | base64 -d 2>/dev/null | jq -r '.oid // empty' 2>/dev/null
+}
+
+# Résout (une seule fois) l'objectId de l'utilisateur connecté.
+resolve_principal_id() {
+    local token
+
+    if [[ -n "$AZ_PRINCIPAL_ID" ]]; then
+        return 0
+    fi
+
+    : > "$AZ_REST_ERROR_FILE"
+    if token="$(az account get-access-token --resource https://management.azure.com/ \
+                    --query accessToken -o tsv 2>"$AZ_REST_ERROR_FILE" </dev/null)"; then
+        AZ_PRINCIPAL_ID="$(_jwt_oid "$(cut -d. -f2 <<<"$token")")"
+    fi
+
+    # Repli si la claim manque : format de jeton inattendu, identité applicative.
+    if [[ -z "$AZ_PRINCIPAL_ID" ]]; then
+        AZ_PRINCIPAL_ID="$(az ad signed-in-user show --query id -o tsv \
+                               2>"$AZ_REST_ERROR_FILE" </dev/null || true)"
+    fi
+
+    if [[ -z "$AZ_PRINCIPAL_ID" ]]; then
+        err "Impossible de déterminer l'objectId de l'utilisateur connecté."
+        explain_az_error
+        return 1
+    fi
+}
+
+# Saisie pré-remplie et éditable en place (readline). Entrée valide le texte
+# affiché à l'écran : le placeholder ne part jamais sans ce passage explicite.
+# Ligne vidée + Entrée = annulation.
+# Écrit dans $JUSTIFICATION plutôt que sur stdout : avec `read -e`, readline
+# écrit l'écho de la ligne, qu'une substitution de commande capturerait.
+prompt_justification() {
+    local answer=""
+
+    JUSTIFICATION=""
+    printf '\n' >&2
+    if ! IFS= read -r -e -i "$DEFAULT_JUSTIFICATION" \
+            -p "Justification (Entrée valide, ligne vide annule) : " answer; then
+        printf '\n' >&2
+        return "$MENU_CANCELLED"
+    fi
+
+    answer="${answer#"${answer%%[![:space:]]*}"}"
+    answer="${answer%"${answer##*[![:space:]]}"}"
+    if [[ -z "$answer" ]]; then
+        return "$MENU_CANCELLED"
+    fi
+
+    JUSTIFICATION="$answer"
+}
+
+new_request_guid() {
+    local guid
+    if command -v uuidgen >/dev/null 2>&1; then
+        guid="$(uuidgen)"
+    else
+        guid="$(< /proc/sys/kernel/random/uuid)"
+    fi
+    printf '%s' "${guid,,}"
+}
+
+iso_utc_now() {
+    date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+# Appel avec corps JSON, même gestion d'erreur que az_rest_get.
+az_rest_send() {
+    local method="$1" url="$2" body="$3" out rc=0
+
+    : > "$AZ_REST_ERROR_FILE"
+    out="$(az rest --method "$method" --url "$url" \
+              --headers "Content-Type=application/json" \
+              --body "$body" -o json 2>"$AZ_REST_ERROR_FILE" </dev/null)" || rc=$?
+
+    (( rc == 0 )) || return "$rc"
+    printf '%s' "$out"
+}
+
+# $2 vide = corps sans linkedRoleEligibilityScheduleId.
+_azure_activation_body() {
+    local index="$1" linked="$2"
+
+    jq -n \
+        --arg principalId "$AZ_PRINCIPAL_ID" \
+        --arg roleDefinitionId "${ROLE_DEFINITION_IDS[$index]}" \
+        --arg justification "$JUSTIFICATION" \
+        --arg start "$(iso_utc_now)" \
+        --arg duration "PT${DEFAULT_DURATION_HOURS}H" \
+        --arg linked "$linked" \
+        '{properties: ({
+            principalId: $principalId,
+            roleDefinitionId: $roleDefinitionId,
+            requestType: "SelfActivate",
+            justification: $justification,
+            scheduleInfo: {
+                startDateTime: $start,
+                expiration: { type: "AfterDuration", duration: $duration }
+            }
+          } + (if $linked == "" then {} else { linkedRoleEligibilityScheduleId: $linked } end))}'
+}
+
+# Soumission ARM. `linkedRoleEligibilityScheduleId` est optionnel côté API :
+# on tente d'abord sans, et on ne rejoue avec que si l'API le réclame — la doc
+# ne le rend obligatoire dans aucun cas, seul le test tranche (cf. goal 3).
+submit_azure_activation() {
+    local index="$1" guid url
+
+    guid="$(new_request_guid)"
+    url="https://management.azure.com${ROLE_SCOPES[$index]}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${guid}?api-version=${ARM_API_VERSION}"
+
+    if az_rest_send PUT "$url" "$(_azure_activation_body "$index" "")" >/dev/null; then
+        POLL_URL="$url"
+        return 0
+    fi
+
+    if az_rest_last_error | grep -qi 'linkedRoleEligibilityScheduleId'; then
+        info "L'API réclame la schedule eligible liée — nouvelle tentative."
+        if az_rest_send PUT "$url" \
+               "$(_azure_activation_body "$index" "${ROLE_SCHEDULE_IDS[$index]}")" >/dev/null; then
+            POLL_URL="$url"
+            return 0
+        fi
+    fi
+
+    err "Échec de la soumission de l'activation Azure."
+    explain_az_error
+    return 1
+}
+
+# Graph attend `afterDuration` en camelCase là où ARM attend `AfterDuration`.
+_entra_activation_body() {
+    local index="$1"
+
+    jq -n \
+        --arg principalId "$AZ_PRINCIPAL_ID" \
+        --arg roleDefinitionId "${ROLE_DEFINITION_IDS[$index]}" \
+        --arg directoryScopeId "${ROLE_SCOPES[$index]}" \
+        --arg justification "$JUSTIFICATION" \
+        --arg start "$(iso_utc_now)" \
+        --arg duration "PT${DEFAULT_DURATION_HOURS}H" \
+        '{
+            action: "selfActivate",
+            principalId: $principalId,
+            roleDefinitionId: $roleDefinitionId,
+            directoryScopeId: $directoryScopeId,
+            justification: $justification,
+            scheduleInfo: {
+                startDateTime: $start,
+                expiration: { type: "afterDuration", duration: $duration }
+            }
+        }'
+}
+
+submit_entra_activation() {
+    local index="$1" response id
+
+    if ! response="$(az_rest_send POST "$GRAPH_REQUESTS_URL" "$(_entra_activation_body "$index")")"; then
+        err "Échec de la soumission de l'activation Entra."
+        explain_az_error
+        return 1
+    fi
+
+    id="$(jq -r '.id // empty' <<<"$response")"
+    if [[ -z "$id" ]]; then
+        err "Réponse Graph sans identifiant de demande — impossible de suivre le statut."
+        return 1
+    fi
+
+    POLL_URL="${GRAPH_REQUESTS_URL}/${id}"
+}
+
+# Les deux API partagent le vocabulaire de statuts (Provisioned, Granted,
+# PendingApproval, Failed…) ; seule l'orthographe de Cancelled/Canceled et
+# l'emplacement du champ diffèrent.
+_request_status() {
+    if [[ "$SCOPE" == "azure" ]]; then
+        jq -r '.properties.status // empty'
+    else
+        jq -r '.status // empty'
+    fi
+}
+
+# 0 = provisionné, 1 = échec API, 2 = toujours en attente au timeout.
+poll_activation() {
+    local elapsed=0 body status last=""
+
+    printf 'Attente du provisionnement ' >&2
+    while (( elapsed < POLL_TIMEOUT_SECONDS )); do
+        if body="$(az_rest_get "$POLL_URL")"; then
+            status="$(_request_status <<<"$body")"
+            if [[ -n "$status" ]]; then
+                last="$status"
+            fi
+            case "$status" in
+                Provisioned|Granted)
+                    printf '\n' >&2
+                    info "Rôle activé (${status}) pour ${DEFAULT_DURATION_HOURS}h."
+                    return 0
+                    ;;
+                Failed|Denied|Revoked|Cancelled|Canceled)
+                    printf '\n' >&2
+                    err "Activation en échec (statut ${status})."
+                    jq -c '.' <<<"$body" >&2
+                    return 1
+                    ;;
+            esac
+        fi
+        printf '.' >&2
+        sleep "$POLL_INTERVAL_SECONDS"
+        elapsed=$(( elapsed + POLL_INTERVAL_SECONDS ))
+    done
+
+    printf '\n' >&2
+    info "Toujours en attente après ${POLL_TIMEOUT_SECONDS}s (dernier statut : ${last:-inconnu})."
+    info "Une demande soumise à approbation continue d'être traitée côté portail ;"
+    info "le workflow d'approbation n'est pas géré par ce script (cf. plan.md)."
+    return 2
+}
+
+# Enchaîne récapitulatif → justification → soumission → polling.
+# Un timeout de polling n'est pas une erreur du script : il remonte 0.
+activate_role() {
+    local index="$1" rc=0
+
+    show_selection "$index"
+
+    if ! prompt_justification; then
+        info "Activation annulée."
+        return 0
+    fi
+
+    resolve_principal_id || return 1
+
+    info ""
+    info "Soumission de la demande (${DEFAULT_DURATION_HOURS}h)…"
+    case "$SCOPE" in
+        azure) submit_azure_activation "$index" || return 1 ;;
+        entra) submit_entra_activation "$index" || return 1 ;;
+        *) err "Scope inconnu : $SCOPE"; return 1 ;;
+    esac
+
+    poll_activation || rc=$?
+    if (( rc == 2 )); then
+        rc=0
+    fi
+    return "$rc"
 }
 
 # ---------------------------------------------------------------------------
