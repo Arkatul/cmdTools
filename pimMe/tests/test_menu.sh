@@ -79,7 +79,7 @@ run_case "0 (hors borne) puis 2"            '0\n2\n'                     1
 run_case "1 backspace 4 puis Entree"        '1\177 4\n'                  3
 run_case "bas puis numero 4"                '\033[B4\n'                  3
 
-printf '\n=== Touches d action (goal 2 : bascule de scope) ===\n'
+printf '\n=== Touches d action (goal 4 : r = recharger la liste) ===\n'
 # run_case ne sert pas ici : on doit lire A LA FOIS stdout (la touche) et le
 # code retour, sur une fonction qui renvoie normalement un index.
 run_hotkey() {

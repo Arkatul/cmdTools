@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 #
-# pim-activate.sh — Activation interactive de rôles PIM Azure / Entra ID.
+# pim-activate.sh — Activation interactive de rôles PIM de ressources Azure.
 #
 # Alternative rapide au portail pour activer un rôle éligible : liste les rôles
 # activables de l'utilisateur connecté, en sélectionne un au clavier, demande
 # une justification, soumet la demande d'activation et suit son statut jusqu'au
-# provisionnement.
+# provisionnement — puis revient à la liste pour enchaîner une autre activation
+# sans relancer le script.
 #
 # Usage :
-#   ./pim-activate.sh [-s|--scope azure|entra] [-h|--help]
+#   ./pim-activate.sh [-s|--scope azure] [-h|--help]
 #
-#   -s, --scope   Périmètre des rôles à lister : azure (rôles de ressources
-#                 Azure) ou entra (rôles d'annuaire Entra ID). Défaut : azure.
-#   -h, --help    Affiche l'aide et quitte.
+#   -s, --scope   Périmètre des rôles à lister. Seule valeur supportée :
+#                 azure (rôles de ressources Azure). Défaut : azure.
+#   -h, --help    Affiche l'aide détaillée et quitte.
+#
+# Fonctionnement :
+#   1. liste des rôles Azure éligibles (scope racine, filtre asTarget) ;
+#   2. sélection au clavier (flèches ou numéro), r rafraîchit, q quitte ;
+#   3. justification saisie à l'écran, obligatoire sur les rôles sensibles ;
+#   4. soumission SelfActivate puis polling du statut jusqu'au provisionnement ;
+#   5. retour automatique à la liste rafraîchie, quel que soit le résultat.
 #
 # Prérequis :
 #   - bash 4+ (tableaux, read -rsn1) — pas de compatibilité sh POSIX visée
@@ -22,15 +30,22 @@
 #   - uuidgen (facultatif) : identifiant de la demande d'activation ARM ;
 #            repli automatique sur /proc/sys/kernel/random/uuid
 #
+# Limitations connues (cf. plan.md, section « hors scope ») :
+#   - pas de désactivation d'un rôle actif — passer par le portail ;
+#   - pas de gestion du workflow d'approbation : une demande en
+#     PendingApproval est affichée puis abandonnée au bout de 60s, elle
+#     continue d'être traitée côté portail ;
+#   - mono-tenant : le tenant est celui de la session az courante ;
+#   - rôles d'annuaire Entra ID non gérés (chemin Graph retiré).
+#
 # Codes de sortie :
-#   0   succès
+#   0   succès (y compris sortie volontaire par q)
 #   1   prérequis manquant ou session Azure absente/illisible
 #   2   erreur d'usage (argument inconnu ou valeur invalide)
 #
-# Note : $MENU_CANCELLED (64) est un retour de fonction interne, pas un code de
-# sortie du script — voir select_from_menu.
+# Note : $MENU_CANCELLED (64) et $ACTIVATION_INTERRUPTED (65) sont des retours
+# de fonction internes, pas des codes de sortie du script.
 #
-
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
@@ -41,7 +56,9 @@ SCRIPT_NAME="$(basename "$0")"
 # Voir plan.md — hypothèse à ajuster selon le tenant.
 DEFAULT_DURATION_HOURS=8
 
-# Périmètre courant : azure | entra. Bascule à chaud par les touches a/e.
+# Périmètre courant. Seule valeur supportée : azure (le chemin Entra ID a été
+# retiré). L'option --scope reste acceptée pour rester explicite en ligne de
+# commande et pour ne pas casser les invocations existantes.
 SCOPE="azure"
 
 MENU_HINT="Flèches haut/bas + Entrée, numéro + Entrée, q pour annuler : "
@@ -52,8 +69,24 @@ MENU_HINT="Flèches haut/bas + Entrée, numéro + Entrée, q pour annuler : "
 # Le trap Ctrl+C du goal 4 doit rester distinguable d'une annulation de menu.
 MENU_CANCELLED=64
 
-# Touches d'action passées au menu par l'appelant (goal 2 : a/e pour basculer
-# de scope). Vide par défaut : le contrat du goal 1 est inchangé.
+# Retour de fonction quand l'utilisateur interrompt (Ctrl+C) une saisie ou une
+# attente : l'appelant doit revenir à la liste, pas quitter. Comme
+# $MENU_CANCELLED, la valeur reste hors de la plage 128+N des signaux pour
+# rester distinguable d'une mort par signal.
+ACTIVATION_INTERRUPTED=65
+
+# Positionné par le trap SIGINT, consommé (et remis à 0) par les boucles qui
+# peuvent être interrompues. Un trap bash ne peut pas « casser » la boucle en
+# cours : il ne fait que lever ce drapeau, que les boucles testent.
+INTERRUPTED=0
+
+# Réglages tty d'origine, restaurés après une interruption : `read -rsn1` bascule
+# le terminal en raw/-echo, et une saisie tuée en plein vol laisserait sinon un
+# terminal muet ou sans curseur.
+SAVED_STTY=""
+
+# Touches d'action passées au menu par l'appelant (goal 4 : r pour recharger
+# la liste). Vide par défaut : le contrat du goal 1 est inchangé.
 MENU_HOTKEYS=()
 # Retour de select_from_menu quand une hotkey est pressée : la touche est
 # écrite sur stdout. Passer par stdout et non par une variable globale est
@@ -62,21 +95,54 @@ MENU_HOTKEY_PRESSED=65
 
 usage() {
     cat <<EOF
-Usage: $SCRIPT_NAME [-s|--scope azure|entra] [-h|--help]
+Usage: $SCRIPT_NAME [-s|--scope azure] [-h|--help]
 
-Activation interactive de rôles PIM (rôles de ressources Azure et rôles
-d'annuaire Entra ID), en alternative au portail.
+Activation interactive de rôles PIM de ressources Azure, en alternative au
+portail. Le script liste les rôles éligibles de l'utilisateur connecté, en
+active un après saisie d'une justification, suit le provisionnement, puis
+revient à la liste rafraîchie pour enchaîner sans redémarrer.
 
 Options:
-  -s, --scope SCOPE   Périmètre des rôles : azure ou entra (défaut: ${SCOPE})
-  -h, --help          Affiche cette aide et quitte
+  -s, --scope SCOPE   Périmètre des rôles. Seule valeur supportée : azure
+                      (défaut: ${SCOPE}). Les rôles d'annuaire Entra ID ne
+                      sont pas gérés.
+  -h, --help          Affiche cette aide et quitte.
+
+Navigation dans la liste:
+  Flèches haut/bas    Déplace la sélection
+  1..N puis Entrée    Sélectionne directement par numéro
+  Entrée              Active le rôle surligné
+  r                   Recharge la liste depuis l'API
+  q                   Quitte le script (code 0)
+  Ctrl+C              Annule la saisie ou l'attente en cours et revient
+                      à la liste ; ne quitte jamais brutalement
+
+Justification:
+  Une justification est proposée pré-remplie et éditable en place. Sur les
+  rôles sensibles (Owner, User Access Administrator) elle est obligatoire :
+  aucun texte n'est pré-rempli et une saisie vide est refusée.
 
 Prérequis:
   az connecté (az login) et jq disponibles dans le PATH.
 
+Limitations connues:
+  - pas de désactivation d'un rôle actif (portail) ;
+  - workflow d'approbation non géré : une demande PendingApproval est
+    affichée puis abandonnée après ${POLL_TIMEOUT_SECONDS}s de polling, sans être annulée ;
+  - mono-tenant : le tenant est celui de la session az courante.
+
 Exemples:
+  # Lister les rôles Azure éligibles et en activer un
   $SCRIPT_NAME
-  $SCRIPT_NAME --scope entra
+
+  # Même chose, périmètre explicite
+  $SCRIPT_NAME --scope azure
+
+  # Afficher cette aide
+  $SCRIPT_NAME --help
+
+Durée d'activation demandée : ${DEFAULT_DURATION_HOURS}h (constante DEFAULT_DURATION_HOURS
+en tête de script).
 EOF
 }
 
@@ -100,6 +166,64 @@ require_dependencies() {
     for cmd in az jq; do
         require_command "$cmd" || return 1
     done
+}
+
+# ---------------------------------------------------------------------------
+# Interruptions et état du terminal
+#
+# Un trap bash ne peut pas « casser » la boucle en cours : il lève un drapeau
+# ($INTERRUPTED) que les boucles interruptibles consomment via take_interrupt.
+# Les substitutions de commande (`x="$(select_from_menu …)"`, `az rest`) sont
+# des sous-shells, où bash réinitialise les traps aux valeurs par défaut : le
+# sous-shell meurt du signal et c'est le shell parent, lui trappé, qui lève le
+# drapeau. Chaque appelant en substitution constate donc l'interruption après
+# coup, sur son propre retour.
+# ---------------------------------------------------------------------------
+
+save_terminal_state() {
+    if [[ -t 0 ]]; then
+        SAVED_STTY="$(stty -g 2>/dev/null || true)"
+    fi
+    return 0
+}
+
+# Rend le terminal utilisable après une saisie tuée en plein vol : `read -rsn1`
+# l'a basculé en raw/-echo, et readline peut avoir masqué le curseur.
+restore_terminal_state() {
+    if [[ -n "$SAVED_STTY" && -t 0 ]]; then
+        stty "$SAVED_STTY" 2>/dev/null || true
+    fi
+    if [[ -t 2 ]]; then
+        printf '\033[?25h' >&2
+    fi
+    return 0
+}
+
+on_interrupt() {
+    INTERRUPTED=1
+    restore_terminal_state
+    printf '\n' >&2
+    info "Interruption (Ctrl+C) — retour à la liste."
+    return 0
+}
+
+# Consomme le drapeau : 0 si une interruption était en attente (et elle est
+# alors remise à zéro), 1 sinon. Un drapeau non consommé ferait traiter la même
+# interruption deux fois.
+take_interrupt() {
+    (( INTERRUPTED )) || return 1
+    INTERRUPTED=0
+    return 0
+}
+
+install_signal_traps() {
+    save_terminal_state
+    trap on_interrupt INT
+    # SIGTERM/SIGHUP ne sont pas rattrapables en « retour au menu » : on rend
+    # simplement le terminal avant de partir.
+    trap 'restore_terminal_state; exit 143' TERM
+    trap 'restore_terminal_state; exit 129' HUP
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -179,8 +303,15 @@ select_from_menu() {
     while true; do
         _menu_render
 
-        # EOF (Ctrl-D) traité comme une annulation.
+        # EOF (Ctrl-D) traité comme une annulation. Une interruption, elle,
+        # ne fait que redemander une touche : le menu reste à l'écran.
+        # (Chemin utile quand le menu tourne dans le shell trappé ; en
+        # substitution de commande, c'est l'appelant qui constate le signal.)
         if ! IFS= read -rsn1 key; then
+            if take_interrupt; then
+                _menu_drawn=0
+                continue
+            fi
             printf '\n' >&2
             return "$MENU_CANCELLED"
         fi
@@ -239,9 +370,9 @@ select_from_menu() {
 
 validate_scope() {
     case "$1" in
-        azure|entra) return 0 ;;
+        azure) return 0 ;;
         *)
-            err "Périmètre invalide : '$1' (valeurs attendues : azure, entra)"
+            err "Périmètre invalide : '$1' (seule valeur supportée : azure)"
             return 1
             ;;
     esac
@@ -336,13 +467,11 @@ check_azure_session() {
 # la boucle par souscription).
 #
 # Les parenthèses de asTarget() DOIVENT être encodées en %28%29 : ARM répond
-# 400 "Bad Request - Invalid URL" sur les parenthèses brutes. Graph, lui, les
-# accepte telles quelles.
+# 400 "Bad Request - Invalid URL" sur les parenthèses brutes.
 # ---------------------------------------------------------------------------
 
 ARM_API_VERSION="2020-10-01"
 ARM_ELIGIBLE_URL="https://management.azure.com/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=${ARM_API_VERSION}&\$filter=asTarget%28%29"
-GRAPH_ELIGIBLE_URL="https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances/filterByCurrentUser(on='principal')?%24expand=roleDefinition"
 
 # Dernière erreur brute renvoyée par az rest, pour un diagnostic exploitable.
 # Stockée dans un FICHIER et non dans une variable : les appelants invoquent
@@ -352,7 +481,7 @@ AZ_REST_ERROR_FILE=""
 
 init_az_rest_error_file() {
     AZ_REST_ERROR_FILE="$(mktemp)"
-    trap 'rm -f "$AZ_REST_ERROR_FILE"' EXIT
+    trap 'rm -f "$AZ_REST_ERROR_FILE"; restore_terminal_state' EXIT
 }
 
 az_rest_last_error() {
@@ -381,24 +510,31 @@ ROLE_LABELS=()
 ROLE_DEFINITION_IDS=()
 ROLE_SCOPES=()
 ROLE_SCHEDULE_IDS=()
+# Nom brut du rôle, séparé du libellé d'affichage (qui y colle le scope) :
+# la règle de justification obligatoire s'y adosse sans découper une chaîne
+# destinée à l'œil.
+ROLE_NAMES=()
 
 reset_roles() {
     ROLE_LABELS=()
     ROLE_DEFINITION_IDS=()
     ROLE_SCOPES=()
     ROLE_SCHEDULE_IDS=()
+    ROLE_NAMES=()
 }
 
-# Alimente les tableaux depuis un flux TSV « label \t defId \t scope \t schedId ».
+# Alimente les tableaux depuis un flux TSV
+# « label \t defId \t scope \t schedId \t nom ».
 # Le TSV vient exclusivement de `jq -r ... | @tsv` : aucune regex sur du JSON.
 ingest_roles_tsv() {
-    local label def_id scope sched_id
-    while IFS=$'\t' read -r label def_id scope sched_id; do
+    local label def_id scope sched_id name
+    while IFS=$'\t' read -r label def_id scope sched_id name; do
         [[ -n "$label" ]] || continue
         ROLE_LABELS+=("$label")
         ROLE_DEFINITION_IDS+=("$def_id")
         ROLE_SCOPES+=("$scope")
         ROLE_SCHEDULE_IDS+=("$sched_id")
+        ROLE_NAMES+=("$name")
     done
 }
 
@@ -424,32 +560,8 @@ list_azure_roles() {
               + ($i.properties.expandedProperties.scope.displayName // $i.properties.scope) ),
             $i.properties.roleDefinitionId,
             $i.properties.scope,
-            $i.properties.roleEligibilityScheduleId
-          ]
-        | @tsv
-    ' <<<"$body" | sort)
-}
-
-list_entra_roles() {
-    local body
-
-    if ! body="$(az_rest_get "$GRAPH_ELIGIBLE_URL")"; then
-        err "Échec de la récupération des rôles Entra eligible."
-        explain_az_error
-        return 1
-    fi
-
-    # Pour Entra, directoryScopeId tient le rôle du scope ARM ; "/" = tenant.
-    ingest_roles_tsv < <(jq -r '
-        .value[]
-        | . as $i
-        | [
-            ( ($i.roleDefinition.displayName // $i.roleDefinitionId)
-              + "  —  annuaire "
-              + (if ($i.directoryScopeId // "/") == "/" then "tenant" else $i.directoryScopeId end) ),
-            $i.roleDefinitionId,
-            ($i.directoryScopeId // "/"),
-            $i.id
+            $i.properties.roleEligibilityScheduleId,
+            ($i.properties.expandedProperties.roleDefinition.displayName // "")
           ]
         | @tsv
     ' <<<"$body" | sort)
@@ -463,7 +575,6 @@ load_roles() {
     reset_roles
     case "$scope" in
         azure) list_azure_roles ;;
-        entra) list_entra_roles ;;
         *) err "Scope inconnu : $scope"; return 1 ;;
     esac
 }
@@ -478,10 +589,6 @@ load_roles() {
 # le contrat du goal 1 reste intact quand MENU_HOTKEYS est vide.
 # ---------------------------------------------------------------------------
 
-other_scope() {
-    [[ "$1" == "azure" ]] && printf 'entra' || printf 'azure'
-}
-
 # Récapitulatif du rôle choisi, affiché juste avant le prompt de justification.
 show_selection() {
     local index="$1"
@@ -493,60 +600,85 @@ show_selection() {
     printf '  schedule eligible    : %s\n' "${ROLE_SCHEDULE_IDS[$index]}" >&2
 }
 
-# Boucle de listing : affiche le scope courant, bascule sur a/e, sort sur q ou
-# sélection. La boucle complète post-activation appartient au goal 4.
+# Après une liste vide ou un échec d'appel : recharger ou quitter. Sans ce
+# point d'arrêt, « revenir à la liste » sur une erreur persistante (réseau
+# coupé, droits manquants) boucle indéfiniment sans jamais rendre la main.
+prompt_retry_or_quit() {
+    local answer rc=0
+
+    # Substitution de commande obligatoire ici aussi : cf. _read_line_edited.
+    answer="$(_read_line_edited "" "Recharger la liste ? [O/n] ")" || rc=$?
+    if (( rc != 0 )); then
+        # Ctrl+C ou EOF sur cette question : on ne relance pas une liste qui
+        # vient d'échouer, on rend la main.
+        take_interrupt || printf '\n' >&2
+        return 1
+    fi
+    [[ ! "$answer" =~ ^[[:space:]]*[nNqQ] ]]
+}
+
+# Boucle principale : liste → sélection → activation → retour à la liste
+# rafraîchie, indéfiniment. Aucun retour d'activate_role ne quitte le script :
+# succès, échec API et annulation ramènent tous à la liste. Seules sorties :
+# `q` au menu (code 0), refus de recharger après un échec, ou une erreur fatale
+# de session détectée par main.
 browse_roles() {
-    local selection rc target
+    local selection rc
 
     while true; do
         info "Chargement des rôles eligible (scope ${SCOPE})…"
-        if ! load_roles "$SCOPE"; then
-            target="$(other_scope "$SCOPE")"
+        # `load_roles` échouant sous set -e sortirait du script avant tout
+        # test : le code est capturé dans la même commande composée.
+        rc=0
+        load_roles "$SCOPE" || rc=$?
+
+        # Une interruption pendant le chargement ne doit pas être lue comme un
+        # échec d'API : on recharge simplement.
+        if take_interrupt; then
+            continue
+        fi
+
+        if (( rc != 0 )); then
             info ""
-            info "Impossible de lister le scope ${SCOPE}."
-            if ! prompt_scope_switch "$target"; then
-                return 1
-            fi
-            SCOPE="$target"
+            info "Impossible de lister les rôles éligibles (scope ${SCOPE})."
+            prompt_retry_or_quit || return 0
             continue
         fi
 
         if (( ${#ROLE_LABELS[@]} == 0 )); then
-            target="$(other_scope "$SCOPE")"
             info ""
             info "Aucun rôle eligible sur ce scope (${SCOPE})."
-            if ! prompt_scope_switch "$target"; then
-                return 0
-            fi
-            SCOPE="$target"
+            prompt_retry_or_quit || return 0
             continue
         fi
 
-        MENU_HOTKEYS=("a" "e")
+        MENU_HOTKEYS=("r")
         # `x="$(cmd)"` qui échoue sort du script sous set -e avant tout rc=$? :
         # on capture le code dans la même commande composée.
         rc=0
         selection="$(select_from_menu \
-            "Rôles ${SCOPE} eligible (${#ROLE_LABELS[@]}) — a=azure e=entra q=quitter :" \
+            "Rôles ${SCOPE} eligible (${#ROLE_LABELS[@]}) — Entrée active, r recharge, q quitte :" \
             "${ROLE_LABELS[@]}")" || rc=$?
         MENU_HOTKEYS=()
 
+        # Ctrl+C au clavier : le menu tourne dans un sous-shell de
+        # substitution, aux traps réinitialisés — il meurt du signal (rc 130)
+        # et c'est ici, dans le shell parent trappé, qu'on le constate.
+        if take_interrupt || (( rc > 128 )); then
+            continue
+        fi
+
         case $rc in
             0)
-                # `cmd; return $?` ne suffit pas sous set -e : un échec de
-                # activate_role sortirait du script avant le return.
-                rc=0
-                activate_role "$selection" || rc=$?
-                return "$rc"
+                # Tout retour ramène à la liste : un échec d'activation n'est
+                # pas une raison de quitter (goal 4, gestion d'erreurs globale).
+                activate_role "$selection" || true
                 ;;
             "$MENU_HOTKEY_PRESSED")
-                case "$selection" in
-                    a) SCOPE="azure" ;;
-                    e) SCOPE="entra" ;;
-                esac
+                # Seule hotkey déclarée : r = recharger la liste.
                 ;;
             "$MENU_CANCELLED")
-                info "Annulé."
+                info "Sortie."
                 return 0
                 ;;
             *)
@@ -555,14 +687,6 @@ browse_roles() {
                 ;;
         esac
     done
-}
-
-# Propose de basculer vers l'autre scope quand le courant est vide ou en échec.
-prompt_scope_switch() {
-    local target="$1" answer
-
-    read -r -p "Basculer vers le scope ${target} ? [o/N] " answer || return 1
-    [[ "$answer" =~ ^[oOyY]$ ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -584,16 +708,48 @@ prompt_scope_switch() {
 # Placeholder « business » proposé à l'écran, éditable avant validation.
 DEFAULT_JUSTIFICATION="Intervention support — troubleshooting"
 
+# Rôles sensibles : justification obligatoire, non vide, et surtout AUCUN texte
+# pré-rempli — un placeholder validé d'un coup d'Entrée ne documente rien et
+# c'est précisément sur ces deux rôles que la trace doit être réelle.
+# Reconnaissance par GUID de rôle intégré (stable, indépendant de la langue du
+# tenant) ET par nom, au cas où l'API ne renvoie pas le displayName attendu.
+STRICT_JUSTIFICATION_ROLE_GUIDS=(
+    "8e3af657-a8ff-443c-a75c-2fe8c4bcb635"  # Owner
+    "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9"  # User Access Administrator
+)
+STRICT_JUSTIFICATION_ROLE_NAMES=(
+    "owner"
+    "user access administrator"
+)
+
 # Polling du statut de la demande. Pas de workflow d'approbation en v1
 # (cf. plan.md) : on affiche l'état et on sort au bout du timeout.
 POLL_INTERVAL_SECONDS=4
 POLL_TIMEOUT_SECONDS=60
 
-GRAPH_REQUESTS_URL="https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests"
-
 AZ_PRINCIPAL_ID=""
 JUSTIFICATION=""
 POLL_URL=""
+
+# 0 = le rôle d'indice $1 exige une justification saisie à la main.
+justification_is_mandatory() {
+    local index="$1" guid name candidate
+
+    name="${ROLE_NAMES[$index]:-}"
+    name="${name,,}"
+    for candidate in "${STRICT_JUSTIFICATION_ROLE_NAMES[@]}"; do
+        [[ "$name" == "$candidate" ]] && return 0
+    done
+
+    # roleDefinitionId ARM = .../roleDefinitions/{guid} : seul le GUID compte.
+    guid="${ROLE_DEFINITION_IDS[$index]##*/}"
+    guid="${guid,,}"
+    for candidate in "${STRICT_JUSTIFICATION_ROLE_GUIDS[@]}"; do
+        [[ "$guid" == "$candidate" ]] && return 0
+    done
+
+    return 1
+}
 
 # Traduit les erreurs az récurrentes en message actionnable, puis affiche le
 # détail brut. Partagé par le listing et l'activation.
@@ -604,8 +760,8 @@ explain_az_error() {
     case "$raw" in
         *PermissionScopeNotGranted*)
             err "L'application Azure CLI n'a pas les permissions Graph requises sur ce tenant."
-            err "Un administrateur doit consentir RoleManagement.Read.Directory (ou"
-            err "RoleEligibilitySchedule.Read.Directory) pour l'app 04b07795-8ddb-461a-bbee-02f9e1bf7b46."
+            err "Seul le repli de résolution de l'objectId (az ad signed-in-user show) en"
+            err "dépend : le listing et l'activation n'appellent que l'API ARM."
             ;;
         *AADSTS70043*|*token_expired*|*invalid_grant*)
             err "Session Azure CLI expirée (sign-in frequency de l'accès conditionnel)."
@@ -613,11 +769,22 @@ explain_az_error() {
             ;;
         *AADSTS50076*|*AADSTS50079*|*MFA*|*mfa*|*claims*)
             err "Ce rôle exige une authentification forte (MFA) récente."
-            err "Relancez 'az login --scope https://graph.microsoft.com//.default' puis réessayez."
+            err "Relancez 'az login --tenant ${AZ_TENANT_ID:-<tenant>}' en validant le"
+            err "second facteur, puis réessayez."
+            ;;
+        *RoleAssignmentExists*|*RoleAssignmentRequestExists*)
+            err "Ce rôle est déjà actif (ou une demande est déjà en cours) sur ce scope."
+            err "Attendez son expiration ou désactivez-le dans le portail PIM."
             ;;
         *RoleAssignmentRequestPolicyValidationFailed*|*MaximumDuration*|*maximum*duration*)
             err "Durée demandée refusée par la politique PIM du rôle."
             err "Baissez DEFAULT_DURATION_HOURS (actuellement ${DEFAULT_DURATION_HOURS}h) en tête de script."
+            ;;
+        *"Connection aborted"*|*"Max retries exceeded"*|*"Failed to establish a new connection"*|\
+        *"Name or service not known"*|*"Temporary failure in name resolution"*|\
+        *"Read timed out"*|*"ConnectionError"*|*"SSLError"*|*"Network is unreachable"*)
+            err "Appel Azure impossible : le réseau ou le service ne répond pas."
+            err "Vérifiez la connectivité (proxy, VPN, DNS) puis rechargez la liste."
             ;;
     esac
 
@@ -668,29 +835,87 @@ resolve_principal_id() {
     fi
 }
 
-# Saisie pré-remplie et éditable en place (readline). Entrée valide le texte
-# affiché à l'écran : le placeholder ne part jamais sans ce passage explicite.
-# Ligne vidée + Entrée = annulation.
+# Lit une ligne éditable en place (readline) et l'écrit sur stdout.
+#
+# À appeler EN SUBSTITUTION DE COMMANDE, et pas autrement : bash quitte le
+# script lorsqu'un signal frappe le builtin `read` du shell principal, même
+# trappé — le trap s'exécute puis le shell part. Dans un sous-shell de
+# substitution, les traps sont réinitialisés : c'est le sous-shell qui meurt
+# (retour 130) et le shell parent, lui, poursuit et voit l'interruption.
+#
+# readline écrit invite et écho sur stdout, que la substitution capturerait
+# avec la réponse : ils sont renvoyés vers le terminal. Hors terminal, readline
+# est de toute façon inactif et il n'y a rien à afficher.
+_read_line_edited() {
+    local prefill="$1" prompt="$2" answer="" echo_to=/dev/null
+
+    if [[ -t 2 && -w /dev/tty ]]; then
+        echo_to=/dev/tty
+    fi
+
+    IFS= read -r -e -i "$prefill" -p "$prompt" answer >"$echo_to" || return $?
+    printf '%s' "$answer"
+}
+
+# Saisie éditée en place (readline). Entrée valide le texte affiché à l'écran :
+# le placeholder ne part jamais sans ce passage explicite.
+#
+# Deux régimes, selon le rôle passé en argument (indice dans les tableaux de
+# rôles ; sans argument, régime standard) :
+#   - standard : placeholder pré-rempli et modifiable, ligne vide = annulation ;
+#   - obligatoire (Owner, User Access Administrator) : rien de pré-rempli, une
+#     ligne vide est refusée et la question est reposée. Ctrl+C annule.
+#
 # Écrit dans $JUSTIFICATION plutôt que sur stdout : avec `read -e`, readline
 # écrit l'écho de la ligne, qu'une substitution de commande capturerait.
 prompt_justification() {
-    local answer=""
+    local index="${1-}" answer="" prefill="$DEFAULT_JUSTIFICATION" prompt mandatory=0 rc=0
 
     JUSTIFICATION=""
+
+    if [[ -n "$index" ]] && justification_is_mandatory "$index"; then
+        mandatory=1
+        prefill=""
+    fi
+
     printf '\n' >&2
-    if ! IFS= read -r -e -i "$DEFAULT_JUSTIFICATION" \
-            -p "Justification (Entrée valide, ligne vide annule) : " answer; then
-        printf '\n' >&2
-        return "$MENU_CANCELLED"
+    if (( mandatory )); then
+        info "Rôle sensible (${ROLE_NAMES[$index]:-${ROLE_LABELS[$index]}}) :"
+        info "justification obligatoire, aucun texte n'est pré-rempli."
+        prompt="Justification obligatoire (Ctrl+C annule) : "
+    else
+        prompt="Justification (Entrée valide, ligne vide annule) : "
     fi
 
-    answer="${answer#"${answer%%[![:space:]]*}"}"
-    answer="${answer%"${answer##*[![:space:]]}"}"
-    if [[ -z "$answer" ]]; then
-        return "$MENU_CANCELLED"
-    fi
+    while true; do
+        answer=""
+        rc=0
+        answer="$(_read_line_edited "$prefill" "$prompt")" || rc=$?
+        if (( rc != 0 )); then
+            # Ctrl+C : le trap a rendu la main au terminal, on remonte un code
+            # distinct pour que l'appelant reparte sur la liste. Sinon (EOF),
+            # c'est une annulation ordinaire.
+            if take_interrupt || (( rc > 128 )); then
+                return "$ACTIVATION_INTERRUPTED"
+            fi
+            printf '\n' >&2
+            return "$MENU_CANCELLED"
+        fi
 
-    JUSTIFICATION="$answer"
+        answer="${answer#"${answer%%[![:space:]]*}"}"
+        answer="${answer%"${answer##*[![:space:]]}"}"
+
+        if [[ -n "$answer" ]]; then
+            JUSTIFICATION="$answer"
+            return 0
+        fi
+
+        if (( mandatory == 0 )); then
+            return "$MENU_CANCELLED"
+        fi
+
+        err "Justification obligatoire pour ce rôle : saisissez un motif (Ctrl+C pour annuler)."
+    done
 }
 
 new_request_guid() {
@@ -771,65 +996,31 @@ submit_azure_activation() {
     return 1
 }
 
-# Graph attend `afterDuration` en camelCase là où ARM attend `AfterDuration`.
-_entra_activation_body() {
-    local index="$1"
 
-    jq -n \
-        --arg principalId "$AZ_PRINCIPAL_ID" \
-        --arg roleDefinitionId "${ROLE_DEFINITION_IDS[$index]}" \
-        --arg directoryScopeId "${ROLE_SCOPES[$index]}" \
-        --arg justification "$JUSTIFICATION" \
-        --arg start "$(iso_utc_now)" \
-        --arg duration "PT${DEFAULT_DURATION_HOURS}H" \
-        '{
-            action: "selfActivate",
-            principalId: $principalId,
-            roleDefinitionId: $roleDefinitionId,
-            directoryScopeId: $directoryScopeId,
-            justification: $justification,
-            scheduleInfo: {
-                startDateTime: $start,
-                expiration: { type: "afterDuration", duration: $duration }
-            }
-        }'
-}
-
-submit_entra_activation() {
-    local index="$1" response id
-
-    if ! response="$(az_rest_send POST "$GRAPH_REQUESTS_URL" "$(_entra_activation_body "$index")")"; then
-        err "Échec de la soumission de l'activation Entra."
-        explain_az_error
-        return 1
-    fi
-
-    id="$(jq -r '.id // empty' <<<"$response")"
-    if [[ -z "$id" ]]; then
-        err "Réponse Graph sans identifiant de demande — impossible de suivre le statut."
-        return 1
-    fi
-
-    POLL_URL="${GRAPH_REQUESTS_URL}/${id}"
-}
-
-# Les deux API partagent le vocabulaire de statuts (Provisioned, Granted,
-# PendingApproval, Failed…) ; seule l'orthographe de Cancelled/Canceled et
-# l'emplacement du champ diffèrent.
+# Statut de la demande ARM. Le vocabulaire est celui de PIM (Provisioned,
+# Granted, PendingApproval, Failed…), l'orthographe de Cancelled/Canceled
+# variant selon les endpoints — les deux sont traitées à l'appel.
 _request_status() {
-    if [[ "$SCOPE" == "azure" ]]; then
-        jq -r '.properties.status // empty'
-    else
-        jq -r '.status // empty'
-    fi
+    jq -r '.properties.status // empty'
 }
 
-# 0 = provisionné, 1 = échec API, 2 = toujours en attente au timeout.
+# 0 = provisionné, 1 = échec API, 2 = toujours en attente au timeout,
+# $ACTIVATION_INTERRUPTED = Ctrl+C pendant l'attente.
+#
+# Ni l'appel az (sous-shell de substitution) ni `sleep` ne rendent la main
+# d'eux-mêmes sur signal : le trap lève le drapeau, la boucle le consomme au
+# tour suivant et sort — la demande, elle, reste soumise côté Azure.
 poll_activation() {
     local elapsed=0 body status last=""
 
     printf 'Attente du provisionnement ' >&2
     while (( elapsed < POLL_TIMEOUT_SECONDS )); do
+        if take_interrupt; then
+            info "Attente interrompue — la demande reste soumise côté Azure."
+            info "Son état est consultable dans le portail PIM."
+            return "$ACTIVATION_INTERRUPTED"
+        fi
+
         if body="$(az_rest_get "$POLL_URL")"; then
             status="$(_request_status <<<"$body")"
             if [[ -n "$status" ]]; then
@@ -849,8 +1040,10 @@ poll_activation() {
                     ;;
             esac
         fi
+        # Échec d'appel isolé (réseau qui tombe en cours de polling) : on ne
+        # sort pas, la demande peut encore aboutir — le prochain tour réessaie.
         printf '.' >&2
-        sleep "$POLL_INTERVAL_SECONDS"
+        sleep "$POLL_INTERVAL_SECONDS" || true
         elapsed=$(( elapsed + POLL_INTERVAL_SECONDS ))
     done
 
@@ -862,31 +1055,59 @@ poll_activation() {
 }
 
 # Enchaîne récapitulatif → justification → soumission → polling.
-# Un timeout de polling n'est pas une erreur du script : il remonte 0.
+# Ne remonte JAMAIS de code destiné à faire quitter le script : la boucle
+# principale reprend la main dans tous les cas. Un timeout de polling et une
+# interruption ne sont pas des erreurs (retour 0) ; un échec d'API remonte 1
+# pour la trace, mais ramène lui aussi à la liste.
 activate_role() {
     local index="$1" rc=0
 
     show_selection "$index"
 
-    if ! prompt_justification; then
-        info "Activation annulée."
-        return 0
-    fi
+    prompt_justification "$index" || rc=$?
+    case $rc in
+        0) ;;
+        "$ACTIVATION_INTERRUPTED")
+            info "Activation abandonnée avant soumission."
+            return 0
+            ;;
+        *)
+            info "Activation annulée."
+            return 0
+            ;;
+    esac
 
-    resolve_principal_id || return 1
+    rc=0
+    resolve_principal_id || rc=$?
+    if (( rc != 0 )); then
+        take_interrupt || true
+        return 1
+    fi
 
     info ""
     info "Soumission de la demande (${DEFAULT_DURATION_HOURS}h)…"
     case "$SCOPE" in
-        azure) submit_azure_activation "$index" || return 1 ;;
-        entra) submit_entra_activation "$index" || return 1 ;;
-        *) err "Scope inconnu : $SCOPE"; return 1 ;;
+        azure)
+            rc=0
+            submit_azure_activation "$index" || rc=$?
+            ;;
+        *)
+            err "Scope inconnu : $SCOPE"
+            return 1
+            ;;
     esac
-
-    poll_activation || rc=$?
-    if (( rc == 2 )); then
-        rc=0
+    if (( rc != 0 )); then
+        # Une soumission interrompue au clavier a pu laisser le drapeau levé :
+        # on le consomme ici pour que la liste ne reparte pas sur un faux signal.
+        take_interrupt || true
+        return 1
     fi
+
+    rc=0
+    poll_activation || rc=$?
+    case $rc in
+        2|"$ACTIVATION_INTERRUPTED") rc=0 ;;
+    esac
     return "$rc"
 }
 
@@ -900,6 +1121,7 @@ main() {
     parse_args "$@" || return $?
 
     require_dependencies || return 1
+    install_signal_traps
     init_az_rest_error_file
     check_azure_session || return 1
 
