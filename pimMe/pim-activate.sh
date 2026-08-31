@@ -6,13 +6,12 @@
 # activables de l'utilisateur connecté, en sélectionne un au clavier, demande
 # une justification, soumet la demande d'activation et suit son statut jusqu'au
 # provisionnement — puis revient à la liste pour enchaîner une autre activation
-# sans relancer le script.
+# sans relancer le script. Seuls les rôles de ressources Azure sont gérés : les
+# rôles d'annuaire Entra ID sont hors périmètre.
 #
 # Usage :
-#   ./pim-activate.sh [-s|--scope azure] [-h|--help]
+#   ./pim-activate.sh [-h|--help]
 #
-#   -s, --scope   Périmètre des rôles à lister. Seule valeur supportée :
-#                 azure (rôles de ressources Azure). Défaut : azure.
 #   -h, --help    Affiche l'aide détaillée et quitte.
 #
 # Fonctionnement :
@@ -41,7 +40,7 @@
 # Codes de sortie :
 #   0   succès (y compris sortie volontaire par q)
 #   1   prérequis manquant ou session Azure absente/illisible
-#   2   erreur d'usage (argument inconnu ou valeur invalide)
+#   2   erreur d'usage (argument inconnu)
 #
 # Note : $MENU_CANCELLED (64) et $ACTIVATION_INTERRUPTED (65) sont des retours
 # de fonction internes, pas des codes de sortie du script.
@@ -55,11 +54,6 @@ SCRIPT_NAME="$(basename "$0")"
 # un refus de la politique est diagnostiqué par explain_az_error.
 # Voir plan.md — hypothèse à ajuster selon le tenant.
 DEFAULT_DURATION_HOURS=8
-
-# Périmètre courant. Seule valeur supportée : azure (le chemin Entra ID a été
-# retiré). L'option --scope reste acceptée pour rester explicite en ligne de
-# commande et pour ne pas casser les invocations existantes.
-SCOPE="azure"
 
 MENU_HINT="Flèches haut/bas + Entrée, numéro + Entrée, q pour annuler : "
 
@@ -95,17 +89,16 @@ MENU_HOTKEY_PRESSED=65
 
 usage() {
     cat <<EOF
-Usage: $SCRIPT_NAME [-s|--scope azure] [-h|--help]
+Usage: $SCRIPT_NAME [-h|--help]
 
 Activation interactive de rôles PIM de ressources Azure, en alternative au
 portail. Le script liste les rôles éligibles de l'utilisateur connecté, en
 active un après saisie d'une justification, suit le provisionnement, puis
-revient à la liste rafraîchie pour enchaîner sans redémarrer.
+revient à la liste rafraîchie pour enchaîner sans redémarrer. Seuls les rôles
+de ressources Azure sont gérés : les rôles d'annuaire Entra ID sont hors
+périmètre.
 
 Options:
-  -s, --scope SCOPE   Périmètre des rôles. Seule valeur supportée : azure
-                      (défaut: ${SCOPE}). Les rôles d'annuaire Entra ID ne
-                      sont pas gérés.
   -h, --help          Affiche cette aide et quitte.
 
 Navigation dans la liste:
@@ -134,9 +127,6 @@ Limitations connues:
 Exemples:
   # Lister les rôles Azure éligibles et en activer un
   $SCRIPT_NAME
-
-  # Même chose, périmètre explicite
-  $SCRIPT_NAME --scope azure
 
   # Afficher cette aide
   $SCRIPT_NAME --help
@@ -368,24 +358,12 @@ select_from_menu() {
 # Arguments
 # ---------------------------------------------------------------------------
 
-validate_scope() {
-    case "$1" in
-        azure) return 0 ;;
-        *)
-            err "Périmètre invalide : '$1' (seule valeur supportée : azure)"
-            return 1
-            ;;
-    esac
-}
-
+# Le script n'a qu'un seul mode d'appel : pas d'option de périmètre, le
+# listing ARM est le seul chemin. Tout argument inconnu reste une erreur
+# d'usage (code 2) accompagnée de l'aide, plutôt qu'un silence.
 parse_args() {
     while (( $# > 0 )); do
         case "$1" in
-            -s|--scope)
-                [[ $# -ge 2 ]] || { err "Option $1 : valeur manquante"; return 2; }
-                SCOPE="$2"
-                shift 2
-                ;;
             -h|--help)
                 usage
                 exit 0
@@ -406,8 +384,6 @@ parse_args() {
                 ;;
         esac
     done
-
-    validate_scope "$SCOPE" || return 2
 }
 
 # ---------------------------------------------------------------------------
@@ -503,7 +479,7 @@ az_rest_get() {
     printf '%s' "$body"
 }
 
-# Tableaux parallèles décrivant les rôles du scope courant. Chaque entrée porte
+# Tableaux parallèles décrivant les rôles éligibles chargés. Chaque entrée porte
 # tout ce dont goal 3 a besoin pour construire la requête d'activation sans
 # re-quêter l'API (cf. contrainte du goal 2).
 ROLE_LABELS=()
@@ -567,23 +543,18 @@ list_azure_roles() {
     ' <<<"$body" | sort)
 }
 
-# Charge les rôles du scope demandé. Retour 0 = chargé (éventuellement vide),
+# Charge les rôles éligibles. Retour 0 = chargé (éventuellement vide),
 # 1 = échec d'appel.
 load_roles() {
-    local scope="$1"
-
     reset_roles
-    case "$scope" in
-        azure) list_azure_roles ;;
-        *) err "Scope inconnu : $scope"; return 1 ;;
-    esac
+    list_azure_roles
 }
 
 # ---------------------------------------------------------------------------
 # Navigation
 #
-# Choix d'implémentation pour la bascule de scope : plutôt que de dupliquer une
-# boucle de lecture clavier au-dessus du menu, select_from_menu accepte des
+# Choix d'implémentation pour les touches d'action (r) : plutôt que de dupliquer
+# une boucle de lecture clavier au-dessus du menu, select_from_menu accepte des
 # touches d'action ($MENU_HOTKEYS) et rend la main avec $MENU_HOTKEY_PRESSED en
 # écrivant la touche sur stdout. Une seule boucle de lecture, un seul rendu, et
 # le contrat du goal 1 reste intact quand MENU_HOTKEYS est vide.
@@ -626,11 +597,11 @@ browse_roles() {
     local selection rc
 
     while true; do
-        info "Chargement des rôles eligible (scope ${SCOPE})…"
+        info "Chargement des rôles eligible…"
         # `load_roles` échouant sous set -e sortirait du script avant tout
         # test : le code est capturé dans la même commande composée.
         rc=0
-        load_roles "$SCOPE" || rc=$?
+        load_roles || rc=$?
 
         # Une interruption pendant le chargement ne doit pas être lue comme un
         # échec d'API : on recharge simplement.
@@ -640,14 +611,14 @@ browse_roles() {
 
         if (( rc != 0 )); then
             info ""
-            info "Impossible de lister les rôles éligibles (scope ${SCOPE})."
+            info "Impossible de lister les rôles éligibles."
             prompt_retry_or_quit || return 0
             continue
         fi
 
         if (( ${#ROLE_LABELS[@]} == 0 )); then
             info ""
-            info "Aucun rôle eligible sur ce scope (${SCOPE})."
+            info "Aucun rôle eligible sur ce périmètre."
             prompt_retry_or_quit || return 0
             continue
         fi
@@ -657,7 +628,7 @@ browse_roles() {
         # on capture le code dans la même commande composée.
         rc=0
         selection="$(select_from_menu \
-            "Rôles ${SCOPE} eligible (${#ROLE_LABELS[@]}) — Entrée active, r recharge, q quitte :" \
+            "Rôles eligible (${#ROLE_LABELS[@]}) — Entrée active, r recharge, q quitte :" \
             "${ROLE_LABELS[@]}")" || rc=$?
         MENU_HOTKEYS=()
 
@@ -1086,16 +1057,8 @@ activate_role() {
 
     info ""
     info "Soumission de la demande (${DEFAULT_DURATION_HOURS}h)…"
-    case "$SCOPE" in
-        azure)
-            rc=0
-            submit_azure_activation "$index" || rc=$?
-            ;;
-        *)
-            err "Scope inconnu : $SCOPE"
-            return 1
-            ;;
-    esac
+    rc=0
+    submit_azure_activation "$index" || rc=$?
     if (( rc != 0 )); then
         # Une soumission interrompue au clavier a pu laisser le drapeau levé :
         # on le consomme ici pour que la liste ne reparte pas sur un faux signal.

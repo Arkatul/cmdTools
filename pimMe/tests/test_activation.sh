@@ -88,7 +88,6 @@ check "payload illisible -> vide" ""          "$(_jwt_oid 'pas-du-base64!!')"
 
 printf '\n=== Statut de la demande ===\n'
 
-SCOPE="azure"
 check "ARM : .properties.status"  "Provisioned" "$(_request_status <<<'{"properties":{"status":"Provisioned"}}')"
 check "ARM : statut absent"       ""            "$(_request_status <<<'{"properties":{}}')"
 
@@ -188,10 +187,16 @@ check "n -> quitte"                 "1" "$(prompt_retry_or_quit < <(printf 'n\n'
 check "q -> quitte"                 "1" "$(prompt_retry_or_quit < <(printf 'q\n') >/dev/null 2>&1; echo $?)"
 check "EOF -> quitte (pas de boucle infinie)" "1" "$(prompt_retry_or_quit < /dev/null >/dev/null 2>&1; echo $?)"
 
-printf '\n=== Périmètre : entra retiré ===\n'
+printf '\n=== Périmètre : entra retiré, --scope retiré ===\n'
 
-check "azure accepté"               "0" "$(validate_scope azure >/dev/null 2>&1; echo $?)"
-check "entra refusé"                "1" "$(validate_scope entra >/dev/null 2>&1; echo $?)"
+# Le périmètre n'est plus un choix : plus de flag, plus de variable, plus de
+# validateur. Ce qui reste à vérifier, c'est qu'aucune trace ne subsiste.
+check "aucune option --scope"       "0" \
+    "$(grep -c -e '--scope' -e '\-s|' "$TARGET")"
+check "aucun validate_scope"        "ko" \
+    "$(declare -f validate_scope >/dev/null 2>&1 && echo ok || echo ko)"
+check "aucune variable SCOPE"       "0" \
+    "$(grep -c '^SCOPE=' "$TARGET")"
 check "aucune URL Graph dans le script" "0" \
     "$(grep -c 'graph\.microsoft\.com' "$TARGET")"
 check "aucune soumission Entra"     "ko" \

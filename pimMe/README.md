@@ -17,7 +17,7 @@ Le script ne déclenche jamais de `az login` : il constate et informe.
 ## Utilisation
 
 ```
-./pim-activate.sh [-s|--scope azure] [-h|--help]
+./pim-activate.sh [-h|--help]
 ```
 
 `--help` détaille options, navigation, règle de justification et limitations.
@@ -33,8 +33,8 @@ Session réelle (deux activations enchaînées, sortie par `q`) :
 ```
 $ ./pim-activate.sh
 Connecté en tant que ADM_XXX@example.be (tenant bb2cf736-…).
-Chargement des rôles eligible (scope azure)…
-Rôles azure eligible (19) — Entrée active, r recharge, q quitte :
+Chargement des rôles eligible…
+Rôles eligible (19) — Entrée active, r recharge, q quitte :
    1) Contributor  —  managementgroup MG-Brucity
    …
 > 16) Reader  —  managementgroup Tenant Root Group
@@ -52,8 +52,8 @@ Justification (Entrée valide, ligne vide annule) : Validation goal 4 - premier 
 Soumission de la demande (8h)…
 Attente du provisionnement .
 Rôle activé (Provisioned) pour 8h.
-Chargement des rôles eligible (scope azure)…            ← retour automatique
-Rôles azure eligible (19) — Entrée active, r recharge, q quitte :
+Chargement des rôles eligible…            ← retour automatique
+Rôles eligible (19) — Entrée active, r recharge, q quitte :
 …
 17
 Rôle sélectionné :
@@ -68,8 +68,8 @@ Justification obligatoire (Ctrl+C annule) : Revue des acces LZ-CPAS - demande ut
 Soumission de la demande (8h)…
 Attente du provisionnement .
 Rôle activé (Provisioned) pour 8h.
-Chargement des rôles eligible (scope azure)…
-Rôles azure eligible (19) — Entrée active, r recharge, q quitte :
+Chargement des rôles eligible…
+Rôles eligible (19) — Entrée active, r recharge, q quitte :
 q
 Sortie.
 $ echo $?
@@ -95,7 +95,7 @@ Erreur : Échec de la soumission de l'activation Azure.
 Erreur : Appel Azure impossible : le réseau ou le service ne répond pas.
 Erreur : Vérifiez la connectivité (proxy, VPN, DNS) puis rechargez la liste.
 ERROR: HTTPSConnectionPool(host='management.azure.com', port=443): Max retries exceeded…
-Chargement des rôles eligible (scope azure)…
+Chargement des rôles eligible…
 ```
 
 Si la liste elle-même ne peut plus être chargée, le script demande
