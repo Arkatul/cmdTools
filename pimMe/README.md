@@ -49,9 +49,10 @@ Rôle sélectionné :
 
 Justification (Entrée valide, ligne vide annule) : Validation goal 4 - premier role du cycle
 
-Soumission de la demande (8h)…
+Durée retenue : 8 h (policy du rôle, maximumDuration PT8H).
+Soumission de la demande (8 h)…
 Attente du provisionnement .
-Rôle activé (Provisioned) pour 8h.
+Rôle activé (Provisioned) pour 8 h.
 Chargement des rôles eligible…            ← retour automatique
 Rôles eligible (19) — Entrée active, r recharge, q quitte :
 …
@@ -65,9 +66,10 @@ Justification obligatoire (Ctrl+C annule) :
 Erreur : Justification obligatoire pour ce rôle : saisissez un motif (Ctrl+C pour annuler).
 Justification obligatoire (Ctrl+C annule) : Revue des acces LZ-CPAS - demande utilisateur
 
-Soumission de la demande (8h)…
+Durée retenue : 8 h (policy du rôle, maximumDuration PT8H).
+Soumission de la demande (8 h)…
 Attente du provisionnement .
-Rôle activé (Provisioned) pour 8h.
+Rôle activé (Provisioned) pour 8 h.
 Chargement des rôles eligible…
 Rôles eligible (19) — Entrée active, r recharge, q quitte :
 q
@@ -75,6 +77,23 @@ Sortie.
 $ echo $?
 0
 ```
+
+### Durée d'activation
+
+La durée maximale autorisée est propre à chaque rôle **et** à chaque scope : sur
+ce tenant elle vaut 4 h, 8 h ou 9 h selon le couple. Avant chaque soumission, le
+script lit la policy PIM du rôle choisi
+(`roleManagementPolicyAssignments`, règle `Expiration_EndUser_Assignment`),
+retient son `maximumDuration` et l'affiche :
+
+```
+Durée retenue : 4 h (policy du rôle, maximumDuration PT4H).
+Soumission de la demande (4 h)…
+```
+
+Un seul appel de policy par activation. Si la lecture échoue, le script se
+replie sur `FALLBACK_DURATION_HOURS` (1 h) et le dit, plutôt que d'abandonner
+l'activation.
 
 ### Justification
 
@@ -90,7 +109,8 @@ déjà actif) est traduit en message actionnable, suivi du détail brut, puis
 ramène à la liste :
 
 ```
-Soumission de la demande (8h)…
+Durée retenue : 8 h (policy du rôle, maximumDuration PT8H).
+Soumission de la demande (8 h)…
 Erreur : Échec de la soumission de l'activation Azure.
 Erreur : Appel Azure impossible : le réseau ou le service ne répond pas.
 Erreur : Vérifiez la connectivité (proxy, VPN, DNS) puis rechargez la liste.

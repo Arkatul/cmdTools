@@ -18,7 +18,8 @@
 #   1. liste des rôles Azure éligibles (scope racine, filtre asTarget) ;
 #   2. sélection au clavier (flèches ou numéro), r rafraîchit, q quitte ;
 #   3. justification saisie à l'écran, obligatoire sur les rôles sensibles ;
-#   4. soumission SelfActivate puis polling du statut jusqu'au provisionnement ;
+#   4. lecture de la durée max dans la policy PIM du rôle, puis soumission
+#      SelfActivate et polling du statut jusqu'au provisionnement ;
 #   5. retour automatique à la liste rafraîchie, quel que soit le résultat.
 #
 # Prérequis :
@@ -49,11 +50,17 @@ set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 
-# Durée d'activation demandée (heures). L'API d'éligibilité n'expose pas le
-# maximum autorisé par la politique PIM : la valeur est envoyée telle quelle et
-# un refus de la politique est diagnostiqué par explain_az_error.
-# Voir plan.md — hypothèse à ajuster selon le tenant.
-DEFAULT_DURATION_HOURS=8
+# Durée de repli (heures), utilisée uniquement quand la policy PIM du rôle est
+# illisible (appel en échec, réponse inattendue). Volontairement basse : mieux
+# vaut une activation courte qu'un refus de la politique. La durée nominale est
+# lue par activation dans la policy du rôle (cf. resolve_activation_duration).
+FALLBACK_DURATION_HOURS=1
+
+# Durée ISO 8601 retenue pour l'activation en cours (ex. PT8H, P1D). Renseignée
+# par resolve_activation_duration juste avant la soumission, et consommée par le
+# corps de requête puis par le message de succès.
+ACTIVATION_DURATION=""
+
 
 MENU_HINT="Flèches haut/bas + Entrée, numéro + Entrée, q pour annuler : "
 
@@ -131,8 +138,12 @@ Exemples:
   # Afficher cette aide
   $SCRIPT_NAME --help
 
-Durée d'activation demandée : ${DEFAULT_DURATION_HOURS}h (constante DEFAULT_DURATION_HOURS
-en tête de script).
+Durée d'activation:
+  La durée maximale autorisée est propre à chaque rôle et à chaque scope. Elle
+  est lue dans la policy PIM du rôle sélectionné (règle
+  Expiration_EndUser_Assignment) juste avant la soumission, et affichée. Si
+  cette lecture échoue, le script se replie sur ${FALLBACK_DURATION_HOURS}h
+  (constante FALLBACK_DURATION_HOURS) plutôt que d'abandonner l'activation.
 EOF
 }
 
@@ -747,9 +758,11 @@ explain_az_error() {
             err "Ce rôle est déjà actif (ou une demande est déjà en cours) sur ce scope."
             err "Attendez son expiration ou désactivez-le dans le portail PIM."
             ;;
-        *RoleAssignmentRequestPolicyValidationFailed*|*MaximumDuration*|*maximum*duration*)
-            err "Durée demandée refusée par la politique PIM du rôle."
-            err "Baissez DEFAULT_DURATION_HOURS (actuellement ${DEFAULT_DURATION_HOURS}h) en tête de script."
+        *RoleAssignmentRequestPolicyValidationFailed*|*MaximumDuration*|*maximum*duration*|*ExpirationRule*)
+            err "Durée refusée par la politique PIM du rôle (${ACTIVATION_DURATION:-inconnue} demandée)."
+            err "La durée a pourtant été lue dans la policy du rôle : la règle a pu"
+            err "changer entre-temps, ou l'activation exige une date de fin explicite."
+            err "Vérifiez la règle Expiration_EndUser_Assignment du rôle dans le portail."
             ;;
         *"Connection aborted"*|*"Max retries exceeded"*|*"Failed to establish a new connection"*|\
         *"Name or service not known"*|*"Temporary failure in name resolution"*|\
@@ -903,6 +916,77 @@ iso_utc_now() {
     date -u +%Y-%m-%dT%H:%M:%SZ
 }
 
+# ---------------------------------------------------------------------------
+# Durée d'activation : lecture de la policy PIM du rôle
+#
+# La durée maximale n'est pas portée par l'éligibilité mais par la policy du
+# rôle, qui dépend du couple (scope, roleDefinitionId) : une constante globale
+# se fait refuser dès qu'un rôle est plus restrictif que les autres
+# (RoleAssignmentRequestPolicyValidationFailed sur l'ExpirationRule).
+#
+# La règle qui gouverne une auto-activation est Expiration_EndUser_Assignment ;
+# les règles Expiration_Admin_* concernent l'attribution par un administrateur
+# et ne s'appliquent pas ici.
+# ---------------------------------------------------------------------------
+
+# Rend une durée ISO 8601 lisible (PT8H -> « 8 h », P1D -> « 1 j »). Une forme
+# inattendue est rendue telle quelle : mieux vaut afficher PT45S que mentir.
+humanize_duration() {
+    local iso="$1" out="" days hours minutes
+
+    [[ "$iso" =~ ^P([0-9]+D)?(T([0-9]+H)?([0-9]+M)?)?$ ]] || { printf '%s' "$iso"; return 0; }
+    days="${BASH_REMATCH[1]%D}"
+    hours="${BASH_REMATCH[3]%H}"
+    minutes="${BASH_REMATCH[4]%M}"
+    [[ -n "$days" ]] && out+="${days} j "
+    [[ -n "$hours" ]] && out+="${hours} h "
+    [[ -n "$minutes" ]] && out+="${minutes} min "
+    out="${out% }"
+    printf '%s' "${out:-$iso}"
+}
+
+# Extrait la durée max d'auto-activation d'une réponse roleManagementPolicy-
+# Assignments. Vide si la règle est absente ou la réponse inattendue.
+_max_duration_from_policy() {
+    jq -r '
+        [ .value[]?.properties.effectiveRules[]?
+          | select(.id == "Expiration_EndUser_Assignment")
+          | .maximumDuration // empty ]
+        | first // empty
+    ' 2>/dev/null
+}
+
+# Renseigne $ACTIVATION_DURATION pour le rôle $1 et affiche la durée retenue.
+# Un seul appel de policy par activation. Ne rend jamais la main en échec : une
+# policy illisible se replie sur FALLBACK_DURATION_HOURS, l'activation courte
+# valant mieux qu'un abandon.
+resolve_activation_duration() {
+    local index="$1" url body duration=""
+
+    # $filter encodé (%24, %20, %27) : l'URL part telle quelle dans az rest, où
+    # un $ nu serait mangé par le shell et une apostrophe nue par l'API.
+    url="https://management.azure.com${ROLE_SCOPES[$index]}/providers/Microsoft.Authorization/roleManagementPolicyAssignments?api-version=${ARM_API_VERSION}&%24filter=roleDefinitionId%20eq%20%27${ROLE_DEFINITION_IDS[$index]}%27"
+
+    if body="$(az_rest_get "$url")"; then
+        duration="$(_max_duration_from_policy <<<"$body")"
+    fi
+
+    if [[ "$duration" =~ ^P([0-9]+D)?(T([0-9]+H)?([0-9]+M)?)?$ && "$duration" != "P" ]]; then
+        ACTIVATION_DURATION="$duration"
+        info "Durée retenue : $(humanize_duration "$duration") (policy du rôle, maximumDuration ${duration})."
+        return 0
+    fi
+
+    ACTIVATION_DURATION="PT${FALLBACK_DURATION_HOURS}H"
+    if [[ -n "$duration" ]]; then
+        info "Durée de policy inexploitable ('${duration}')."
+    else
+        info "Policy PIM du rôle illisible : $(az_rest_last_error | head -1)"
+    fi
+    info "Durée retenue : $(humanize_duration "$ACTIVATION_DURATION") (repli FALLBACK_DURATION_HOURS)."
+    return 0
+}
+
 # Appel avec corps JSON, même gestion d'erreur que az_rest_get.
 az_rest_send() {
     local method="$1" url="$2" body="$3" out rc=0
@@ -925,7 +1009,7 @@ _azure_activation_body() {
         --arg roleDefinitionId "${ROLE_DEFINITION_IDS[$index]}" \
         --arg justification "$JUSTIFICATION" \
         --arg start "$(iso_utc_now)" \
-        --arg duration "PT${DEFAULT_DURATION_HOURS}H" \
+        --arg duration "$ACTIVATION_DURATION" \
         --arg linked "$linked" \
         '{properties: ({
             principalId: $principalId,
@@ -1000,7 +1084,7 @@ poll_activation() {
             case "$status" in
                 Provisioned|Granted)
                     printf '\n' >&2
-                    info "Rôle activé (${status}) pour ${DEFAULT_DURATION_HOURS}h."
+                    info "Rôle activé (${status}) pour $(humanize_duration "$ACTIVATION_DURATION")."
                     return 0
                     ;;
                 Failed|Denied|Revoked|Cancelled|Canceled)
@@ -1056,7 +1140,16 @@ activate_role() {
     fi
 
     info ""
-    info "Soumission de la demande (${DEFAULT_DURATION_HOURS}h)…"
+    resolve_activation_duration "$index"
+
+    # Un Ctrl+C pendant l'appel de policy ne doit pas se solder par une
+    # soumission surprise : on s'arrête avant, comme pour la justification.
+    if take_interrupt; then
+        info "Activation abandonnée avant soumission."
+        return 0
+    fi
+
+    info "Soumission de la demande ($(humanize_duration "$ACTIVATION_DURATION"))…"
     rc=0
     submit_azure_activation "$index" || rc=$?
     if (( rc != 0 )); then

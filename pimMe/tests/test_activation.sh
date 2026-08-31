@@ -58,6 +58,7 @@ ROLE_NAMES=("Owner" "User Access Administrator" "Reader")
 AZ_PRINCIPAL_ID="11111111-2222-3333-4444-555555555555"
 # Volontairement piégeuse : guillemets, apostrophe, accents, backslash.
 JUSTIFICATION='Incident "P1" — l'"'"'accès prod\test'
+ACTIVATION_DURATION="PT4H"
 
 printf '=== Corps de requête Azure (ARM) ===\n'
 
@@ -68,7 +69,7 @@ check "principalId = utilisateur"         "$AZ_PRINCIPAL_ID" "$(jq -r '.properti
 check "roleDefinitionId"                  "${ROLE_DEFINITION_IDS[0]}" "$(jq -r '.properties.roleDefinitionId' <<<"$body")"
 check "justification échappée telle quelle" "$JUSTIFICATION" "$(jq -r '.properties.justification' <<<"$body")"
 check "expiration.type"                   "AfterDuration" "$(jq -r '.properties.scheduleInfo.expiration.type' <<<"$body")"
-check "duration = DEFAULT_DURATION_HOURS" "PT${DEFAULT_DURATION_HOURS}H" "$(jq -r '.properties.scheduleInfo.expiration.duration' <<<"$body")"
+check "duration = durée résolue"          "$ACTIVATION_DURATION" "$(jq -r '.properties.scheduleInfo.expiration.duration' <<<"$body")"
 check "startDateTime au format ISO UTC"   "ok" "$(jq -r '.properties.scheduleInfo.startDateTime' <<<"$body" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' && echo ok || echo ko)"
 check "linked absent par défaut"          "null" "$(jq -r '.properties.linkedRoleEligibilityScheduleId // "null"' <<<"$body")"
 
@@ -202,6 +203,32 @@ check "aucune URL Graph dans le script" "0" \
 check "aucune soumission Entra"     "ko" \
     "$(declare -f submit_entra_activation >/dev/null 2>&1 && echo ok || echo ko)"
 
+printf '\n=== Durée lue dans la policy PIM ===\n'
+
+# Réponse réelle abrégée : les trois règles d'expiration cohabitent, seule
+# Expiration_EndUser_Assignment gouverne une auto-activation.
+policy_json() {
+    cat <<'JSON'
+{"value":[{"properties":{"effectiveRules":[
+  {"id":"Expiration_Admin_Eligibility","ruleType":"RoleManagementPolicyExpirationRule","maximumDuration":"P365D"},
+  {"id":"Expiration_Admin_Assignment","ruleType":"RoleManagementPolicyExpirationRule","maximumDuration":"P180D"},
+  {"id":"Expiration_EndUser_Assignment","ruleType":"RoleManagementPolicyExpirationRule","maximumDuration":"PT8H"}
+]}}]}
+JSON
+}
+
+check "maximumDuration extrait"      "PT8H" "$(policy_json | _max_duration_from_policy)"
+check "règles admin ignorées"        "1"    "$(policy_json | _max_duration_from_policy | grep -c '^PT8H$')"
+check "réponse vide -> rien"         ""     "$(printf '{"value":[]}' | _max_duration_from_policy)"
+check "règle absente -> rien"        ""     "$(printf '{"value":[{"properties":{"effectiveRules":[{"id":"Enablement_EndUser_Assignment"}]}}]}' | _max_duration_from_policy)"
+check "JSON illisible -> rien"       ""     "$(printf 'pas du json' | _max_duration_from_policy)"
+
+check "PT8H lisible"                 "8 h"  "$(humanize_duration PT8H)"
+check "P1D lisible"                  "1 j"  "$(humanize_duration P1D)"
+check "PT1H30M lisible"              "1 h 30 min" "$(humanize_duration PT1H30M)"
+check "PT30M lisible"                "30 min" "$(humanize_duration PT30M)"
+check "forme inattendue rendue telle quelle" "PT45S" "$(humanize_duration PT45S)"
+
 printf '\n=== Diagnostic des erreurs az ===\n'
 
 AZ_REST_ERROR_FILE="$(mktemp)"
@@ -212,16 +239,27 @@ diagnose() {
     printf '%s\n' "$1" > "$AZ_REST_ERROR_FILE"
     explain_az_error 2>&1
 }
-check "consentement Graph manquant" "ok" "$(diagnose 'ERROR: PermissionScopeNotGranted' | grep -q 'permissions Graph' && echo ok || echo ko)"
-check "session expirée (AADSTS70043)" "ok" "$(diagnose 'SubError: token_expired AADSTS70043: refresh token expired' | grep -q 'Session Azure CLI expirée' && echo ok || echo ko)"
-check "rappel du tenant dans az login" "ok" "$(diagnose 'AADSTS70043' | grep -q "$AZ_TENANT_ID" && echo ok || echo ko)"
-check "MFA requis"                  "ok" "$(diagnose 'AADSTS50076: due to a configuration change made by your administrator' | grep -q 'authentification forte' && echo ok || echo ko)"
-check "rôle déjà actif"             "ok" "$(diagnose 'ERROR: Bad Request({"error":{"code":"RoleAssignmentExists","message":"The Role assignment already exists."}})' | grep -q 'déjà actif' && echo ok || echo ko)"
-check "durée refusée par la politique" "ok" "$(diagnose 'RoleAssignmentRequestPolicyValidationFailed' | grep -q 'DEFAULT_DURATION_HOURS' && echo ok || echo ko)"
-check "détail brut toujours affiché" "ok" "$(diagnose 'Erreur inconnue XYZ' | grep -q 'Erreur inconnue XYZ' && echo ok || echo ko)"
+
+# `diagnose … | grep -q` est une course perdue d'avance : grep -q sort dès la
+# ligne qui correspond, explain_az_error prend un SIGPIPE sur la ligne suivante
+# et pipefail transforme le succès en échec, au hasard du timing. On matérialise
+# donc la sortie avant de la filtrer.
+diag_has() {
+    local out
+    out="$(diagnose "$1")"
+    grep -q "$2" <<<"$out" && echo ok || echo ko
+}
+check "consentement Graph manquant" "ok" "$(diag_has 'ERROR: PermissionScopeNotGranted' 'permissions Graph')"
+check "session expirée (AADSTS70043)" "ok" "$(diag_has 'SubError: token_expired AADSTS70043: refresh token expired' 'Session Azure CLI expirée')"
+check "rappel du tenant dans az login" "ok" "$(diag_has 'AADSTS70043' "$AZ_TENANT_ID")"
+check "MFA requis"                  "ok" "$(diag_has 'AADSTS50076: due to a configuration change made by your administrator' 'authentification forte')"
+check "rôle déjà actif"             "ok" "$(diag_has 'ERROR: Bad Request({"error":{"code":"RoleAssignmentExists","message":"The Role assignment already exists."}})' 'déjà actif')"
+check "durée refusée par la politique" "ok" "$(diag_has 'RoleAssignmentRequestPolicyValidationFailed' 'Expiration_EndUser_Assignment')"
+check "durée demandée rappelée"     "ok" "$(diag_has 'ExpirationRule' 'PT4H')"
+check "détail brut toujours affiché" "ok" "$(diag_has 'Erreur inconnue XYZ' 'Erreur inconnue XYZ')"
 # Panne réseau : le message doit rester lisible et parler connectivité.
-check "réseau injoignable (DNS)"    "ok" "$(diagnose "urllib3 ... Failed to establish a new connection: [Errno -3] Temporary failure in name resolution" | grep -q 'réseau ou le service ne répond pas' && echo ok || echo ko)"
-check "réseau injoignable (timeout)" "ok" "$(diagnose 'HTTPSConnectionPool(host=management.azure.com): Read timed out. (read timeout=300)' | grep -q 'réseau ou le service ne répond pas' && echo ok || echo ko)"
+check "réseau injoignable (DNS)"    "ok" "$(diag_has "urllib3 ... Failed to establish a new connection: [Errno -3] Temporary failure in name resolution" 'réseau ou le service ne répond pas')"
+check "réseau injoignable (timeout)" "ok" "$(diag_has 'HTTPSConnectionPool(host=management.azure.com): Read timed out. (read timeout=300)' 'réseau ou le service ne répond pas')"
 
 printf '\n'
 if (( fails == 0 )); then
