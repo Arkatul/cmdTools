@@ -239,17 +239,27 @@ diagnose() {
     printf '%s\n' "$1" > "$AZ_REST_ERROR_FILE"
     explain_az_error 2>&1
 }
-check "consentement Graph manquant" "ok" "$(diagnose 'ERROR: PermissionScopeNotGranted' | grep -q 'permissions Graph' && echo ok || echo ko)"
-check "session expirée (AADSTS70043)" "ok" "$(diagnose 'SubError: token_expired AADSTS70043: refresh token expired' | grep -q 'Session Azure CLI expirée' && echo ok || echo ko)"
-check "rappel du tenant dans az login" "ok" "$(diagnose 'AADSTS70043' | grep -q "$AZ_TENANT_ID" && echo ok || echo ko)"
-check "MFA requis"                  "ok" "$(diagnose 'AADSTS50076: due to a configuration change made by your administrator' | grep -q 'authentification forte' && echo ok || echo ko)"
-check "rôle déjà actif"             "ok" "$(diagnose 'ERROR: Bad Request({"error":{"code":"RoleAssignmentExists","message":"The Role assignment already exists."}})' | grep -q 'déjà actif' && echo ok || echo ko)"
-check "durée refusée par la politique" "ok" "$(diagnose 'RoleAssignmentRequestPolicyValidationFailed' | grep -q 'Expiration_EndUser_Assignment' && echo ok || echo ko)"
-check "durée demandée rappelée"     "ok" "$(diagnose 'ExpirationRule' | grep -q 'PT4H' && echo ok || echo ko)"
-check "détail brut toujours affiché" "ok" "$(diagnose 'Erreur inconnue XYZ' | grep -q 'Erreur inconnue XYZ' && echo ok || echo ko)"
+
+# `diagnose … | grep -q` est une course perdue d'avance : grep -q sort dès la
+# ligne qui correspond, explain_az_error prend un SIGPIPE sur la ligne suivante
+# et pipefail transforme le succès en échec, au hasard du timing. On matérialise
+# donc la sortie avant de la filtrer.
+diag_has() {
+    local out
+    out="$(diagnose "$1")"
+    grep -q "$2" <<<"$out" && echo ok || echo ko
+}
+check "consentement Graph manquant" "ok" "$(diag_has 'ERROR: PermissionScopeNotGranted' 'permissions Graph')"
+check "session expirée (AADSTS70043)" "ok" "$(diag_has 'SubError: token_expired AADSTS70043: refresh token expired' 'Session Azure CLI expirée')"
+check "rappel du tenant dans az login" "ok" "$(diag_has 'AADSTS70043' "$AZ_TENANT_ID")"
+check "MFA requis"                  "ok" "$(diag_has 'AADSTS50076: due to a configuration change made by your administrator' 'authentification forte')"
+check "rôle déjà actif"             "ok" "$(diag_has 'ERROR: Bad Request({"error":{"code":"RoleAssignmentExists","message":"The Role assignment already exists."}})' 'déjà actif')"
+check "durée refusée par la politique" "ok" "$(diag_has 'RoleAssignmentRequestPolicyValidationFailed' 'Expiration_EndUser_Assignment')"
+check "durée demandée rappelée"     "ok" "$(diag_has 'ExpirationRule' 'PT4H')"
+check "détail brut toujours affiché" "ok" "$(diag_has 'Erreur inconnue XYZ' 'Erreur inconnue XYZ')"
 # Panne réseau : le message doit rester lisible et parler connectivité.
-check "réseau injoignable (DNS)"    "ok" "$(diagnose "urllib3 ... Failed to establish a new connection: [Errno -3] Temporary failure in name resolution" | grep -q 'réseau ou le service ne répond pas' && echo ok || echo ko)"
-check "réseau injoignable (timeout)" "ok" "$(diagnose 'HTTPSConnectionPool(host=management.azure.com): Read timed out. (read timeout=300)' | grep -q 'réseau ou le service ne répond pas' && echo ok || echo ko)"
+check "réseau injoignable (DNS)"    "ok" "$(diag_has "urllib3 ... Failed to establish a new connection: [Errno -3] Temporary failure in name resolution" 'réseau ou le service ne répond pas')"
+check "réseau injoignable (timeout)" "ok" "$(diag_has 'HTTPSConnectionPool(host=management.azure.com): Read timed out. (read timeout=300)' 'réseau ou le service ne répond pas')"
 
 printf '\n'
 if (( fails == 0 )); then
